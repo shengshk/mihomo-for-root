@@ -1,0 +1,98 @@
+# Missing fields inherit these defaults; user YAML and phone overrides take priority.
+# This template contains no personal domains, nodes, subscriptions or credentials.
+mixed-port: 7890
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: info
+ipv6: true
+unified-delay: true
+tcp-concurrent: true
+global-ua: clash.meta
+external-controller: 127.0.0.1:9090
+external-ui: ./dashboard
+external-ui-url: https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip
+secret: ""
+geodata-mode: true
+geodata-loader: memconservative
+geo-auto-update: true
+geo-update-interval: 72
+geox-url:
+  geoip: https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat
+  geosite: https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat
+  mmdb: https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb
+  asn: https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb
+sniffer:
+  enable: true
+  sniff:
+    HTTP: {ports: [80, 8080-8880], override-destination: true}
+    TLS: {ports: [443, 8443]}
+    QUIC: {ports: [443, 8443]}
+  parse-pure-ip: true
+  force-dns-mapping: true
+dns:
+  enable: true
+  listen: 127.0.0.1:15353
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  # Benchmarking prefix, outside fc00::/7 used by common private-network exclusions.
+  fake-ip-range6: 2001:2::1/64
+  fake-ip-filter-mode: blacklist
+  # CN is added separately according to blacklist / rule / whitelist semantics.
+  fake-ip-filter:
+    - '+.lan'
+    - '*.local'
+    - '+.plex.direct'
+    - '+.argotunnel.com'
+    - '+.cftunnel.com'
+    - '+.cloudflare.com'
+    - '+.cloudflare-gateway.com'
+    - '+.gstatic.com'
+    - '+.miwifi.com'
+    - '+.market.xiaomi.com'
+    - '+.push.apple.com'
+    - '+.googleapis.cn'
+    - '+.xn--ngstr-lra8j.com'
+    - clientservices.googleapis.com
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+tun:
+  enable: true
+  device: Meta
+  stack: gvisor
+  inet6-address: ["2001:2::1/126"]
+  auto-route: true
+  auto-redirect: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+  # Whole-list replacement: an explicit user list (including []) wins.
+  route-exclude-address:
+    - 0.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+    - 127.0.0.0/8
+    - 169.254.0.0/16
+    - 224.0.0.0/4
+    - 255.255.255.255/32
+    - "::/128"
+    - "::1/128"
+    - "fc00::/7"
+    - "fe80::/10"
+    - "ff00::/8"
+  include-uid: []
+  exclude-uid: []
+proxies: []
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies: [DIRECT]
+rules:
+  - MATCH,节点选择

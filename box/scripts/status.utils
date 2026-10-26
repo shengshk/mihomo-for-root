@@ -1,0 +1,41 @@
+#!/system/bin/sh
+# One formatter for the overview and KernelSU/Magisk module description.
+mfr_status_line() {
+  local config="$1" state="$2" routing="$3" values capture mode family configured_route agh
+  values=$("$bin_dir/yq" -r '[.tun.enable // false, .dns."enhanced-mode" // "redir-host", .ipv6 // false, .mode // "rule"] | map(to_string) | join("|")' "$config" 2>/dev/null)
+  IFS='|' read -r capture mode family configured_route <<VALUES
+$values
+VALUES
+  [ -n "$routing" ] || routing="$configured_route"
+  case "$state" in running) state="运行中" ;; paused) state="已暂停" ;; error) state="启动失败" ;; *) state="已停止" ;; esac
+  case "$routing" in global) routing="全局" ;; direct) routing="直连" ;; *) routing="规则" ;; esac
+  if [ "$capture" = true ]; then capture=TUN; else capture=TProxy; fi
+  case "$mode" in fake-ip) mode=Fake-IP ;; redir-host) mode=Redir-Host ;; *) mode=DNS ;; esac
+  if [ "$family" = true ]; then family="IPv6 开"; else family="IPv6 关"; fi
+  agh="系统 DNS"
+  if [ "${adguardhome_enabled:-false}" = true ]; then
+    agh=AGH
+  elif [ "$state" = "运行中" ] && [ "$("$bin_dir/yq" -r '.dns.enable' "$config")" = true ]; then
+    if [ "${dns_hijack_tcp:-false}" = true ] || [ "${dns_hijack_udp:-false}" = true ] ||
+       { [ "$capture" = TUN ] && [ "$("$bin_dir/yq" '.tun."dns-hijack" | length' "$config")" -gt 0 ]; }; then agh="DNS 劫持"; fi
+  fi
+  printf '%s · %s · %s · %s · %s · %s\n' "$state" "$routing" "$capture" "$mode" "$family" "$agh"
+}
+mfr_write_description() {
+  local prop=/data/adb/modules/box_for_root/module.prop
+  [ -f "$prop" ] || return 0
+  grep -Fxq "description=$1" "$prop" || sed -i "s/^description=.*/description=$1/" "$prop"
+}
+mfr_refresh_description() (
+  umask 077
+  local state="${1:-}" config="$box_dir/mihomo/.box-runtime.yaml"
+  [ -s "$config" ] || config="$mihomo_config"
+  if [ -z "$state" ]; then
+    state=stopped
+    adg_core_alive && state=running
+  fi
+  if [ "$state" = stopped ] && [ -f "$box_run_state/wifi-paused" ] &&
+     [ "$(cat "$manage_dir/service-intent" 2>/dev/null)" = running ] &&
+     [ ! -f /data/adb/modules/box_for_root/disable ]; then state=paused; fi
+  mfr_write_description "$(mfr_status_line "$config" "$state" "" "")"
+)

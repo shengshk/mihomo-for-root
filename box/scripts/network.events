@@ -1,0 +1,53 @@
+#!/system/bin/sh
+# Block on RTNETLINK notifications. Each existing watcher owns its pipe and
+# child; unsupported/failed monitors leave the timed fallback available.
+mfr_events_open() {
+  events_fifo="$box_run_state/events-$1.$$"
+  rm -f "$events_fifo"
+  mkfifo -m 600 "$events_fifo" || return 1
+  exec 9<> "$events_fifo"
+  mfr_events_ensure
+}
+
+mfr_events_ensure() {
+  if [ -n "${events_pid:-}" ] && kill -0 "$events_pid" 2>/dev/null; then return 0; fi
+  [ -z "${events_pid:-}" ] || wait "$events_pid" 2>/dev/null || :
+  # Close inherited FD 9 so the child cannot keep the read end alive.
+  ( exec 9>&-; exec ip monitor link address route ) > "$events_fifo" 2>/dev/null &
+  events_pid=$!
+}
+
+mfr_events_wait() {
+  local event count=0
+  IFS= read -r -t "$1" event <&9 || return 1
+  # One fixed window merges bursts; never wait indefinitely for a quiet link.
+  sleep 1
+  while [ "$count" -lt 128 ] && IFS= read -r -t 0.01 event <&9; do
+    count=$((count + 1))
+  done
+  return 0
+}
+
+mfr_events_close() {
+  if [ -n "${events_pid:-}" ]; then
+    kill "$events_pid" 2>/dev/null || :
+    wait "$events_pid" 2>/dev/null || :
+    events_pid=""
+  fi
+  exec 9>&-
+  [ -z "${events_fifo:-}" ] || rm -f "$events_fifo"
+  return 0
+}
+
+mfr_network_interval() {
+  local interval="${network_dns_interval:-60}"
+  case "$interval" in ''|*[!0-9]*) interval=60 ;; esac
+  [ "$interval" -ge 60 ] && [ "$interval" -le 300 ] || interval=60
+  printf '%s\n' "$interval"
+}
+
+mfr_uptime() {
+  local seconds rest
+  read -r seconds rest < /proc/uptime
+  printf '%s\n' "${seconds%%.*}"
+}

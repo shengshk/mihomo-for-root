@@ -1,0 +1,7 @@
+/dist/
+/backups/
+/assets/
+/.ops/machine
+__pycache__/
+*.pyc
+

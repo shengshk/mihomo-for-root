@@ -1,0 +1,41 @@
+#!/system/bin/sh
+umask 077
+scripts_dir="${0%/*}"
+. /data/adb/box/settings.ini
+pid_file="$box_run_state/manager-http.pid"
+web="$box_dir/manage-web"
+alive() {
+  local p
+  p=$(cat "$pid_file" 2>/dev/null)
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null && grep -q httpd "/proc/$p/cmdline" && grep -q "$web" "/proc/$p/cmdline"
+}
+case "$1" in
+  start)
+    alive && exit 0
+    if ! mkdir "$box_run_state/manager-http.start" 2>/dev/null; then
+      stamp=$(stat -c %Y "$box_run_state/manager-http.start" 2>/dev/null)
+      [ -n "$stamp" ] && [ $(($(date +%s) - stamp)) -gt 30 ] || exit 0
+      rmdir "$box_run_state/manager-http.start" 2>/dev/null && mkdir "$box_run_state/manager-http.start" || exit 0
+    fi
+    trap 'rmdir "$box_run_state/manager-http.start" 2>/dev/null' EXIT
+    mkdir -p "$web/cgi-bin"
+    cp /data/adb/modules/box_for_root/webroot/manage.* /data/adb/modules/box_for_root/webroot/rpc.js /data/adb/modules/box_for_root/webroot/apps.js "$web/" || exit 1
+    cp /data/adb/modules/box_for_root/webroot/pwa.js /data/adb/modules/box_for_root/webroot/theme.js /data/adb/modules/box_for_root/webroot/sw.js /data/adb/modules/box_for_root/webroot/manifest*.webmanifest /data/adb/modules/box_for_root/webroot/icon* "$web/" || exit 1
+    cp "$web/manage.html" "$web/index.html"
+    cp "$scripts_dir/http.cgi" "$web/cgi-bin/manager"
+    chmod 700 "$web/cgi-bin/manager"
+    printf '.webmanifest:application/manifest+json\n.svg:image/svg+xml\n.js:application/javascript\n' > "$web/httpd.conf"
+    nohup busybox httpd -f -p 127.0.0.1:9091 -h "$web" -c "$web/httpd.conf" </dev/null > "$box_run/manager-http.log" 2>&1 &
+    printf '%s\n' "$!" > "$pid_file"
+    ;;
+  stop)
+    if alive; then
+      p=$(cat "$pid_file"); kill "$p" 2>/dev/null
+      count=0
+      while kill -0 "$p" 2>/dev/null && [ "$count" -lt 5 ]; do sleep 1; count=$((count+1)); done
+    fi
+    rm -f "$pid_file" ;;
+  restart) "$0" stop; "$0" start ;;
+  *) exit 1 ;;
+esac

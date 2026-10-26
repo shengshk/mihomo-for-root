@@ -1,0 +1,128 @@
+#!/system/bin/sh
+if [ -z "${mfr_dns_port:-}" ] && [ -n "${box_dir:-}" ]; then . "$box_dir/scripts/ports.utils"; fi
+
+# A private full template replaces factory defaults; candidate paths are scoped
+# to validation commands and inherited by their child shell only.
+mfr_defaults_path() {
+  local custom="${manage_dir:-$box_dir/manage}/defaults.yaml"
+  if [ -n "${MFR_DEFAULTS_FILE:-}" ]; then
+    printf '%s\n' "$MFR_DEFAULTS_FILE"
+  elif [ -f "$custom" ]; then
+    printf '%s\n' "$custom"
+  else
+    printf '%s\n' "$box_dir/templates/default.yaml"
+  fi
+}
+
+# Resolve capture together with the runtime TUN preference. Never leave a
+# disabled TUN selected as the phone capture mechanism.
+mfr_tun_resolve() {
+  local enabled=true
+  case "${tun_mode:-follow}" in
+    on) ;;
+    off) enabled=false ;;
+    *)
+      if [ -s "$1" ]; then
+        enabled=$("$bin_dir/yq" -r '.tun.enable' "$1" 2>/dev/null)
+        if [ "$enabled" = null ]; then enabled=$("$bin_dir/yq" -r '.tun.enable == true' "$(mfr_defaults_path)"); fi
+      fi ;;
+  esac
+  if [ "$enabled" = false ]; then network_mode=tproxy; else network_mode=tun; fi
+}
+
+# Follow the completed YAML: a missing key inherits the module template;
+# an explicit empty list disables interception instead of inheriting it.
+mfr_dns_yaml() {
+  local input="$1"
+  if [ "$("$bin_dir/yq" '(.tun // {}) | has("dns-hijack")' "$input" 2>/dev/null)" = true ]; then
+    printf '%s\n' "$input"
+  else
+    mfr_defaults_path
+  fi
+}
+
+mfr_dns_resolve() {
+  local input="${1:-$mihomo_config}" from entries
+  dns_hijack_tcp=false
+  dns_hijack_udp=false
+  if [ "${adguardhome_enabled:-false}" = true ]; then
+    dns_hijack_mode=disable
+    mihomo_dns_forward=disable
+    return 0
+  fi
+  case "${dns_hijack_setting:-follow}" in
+    on) dns_hijack_tcp=true; dns_hijack_udp=true ;;
+    off) ;;
+    *)
+      from=$(mfr_dns_yaml "$input")
+      if [ "$("$bin_dir/yq" '.dns.enable' "$input" 2>/dev/null)" != false ]; then
+        entries=$("$bin_dir/yq" -r '.tun."dns-hijack"[]' "$from" 2>/dev/null)
+        # Address-specific TUN entries stay address-specific: do not redirect
+        # every DNS query in iptables when YAML names just one destination.
+        printf '%s\n' "$entries" | grep -Eq '^(any:53|udp://any:53|0\.0\.0\.0:53|udp://0\.0\.0\.0:53)$' && dns_hijack_udp=true
+        printf '%s\n' "$entries" | grep -Eq '^tcp://(any|0\.0\.0\.0):53$' && dns_hijack_tcp=true
+      fi
+      ;;
+  esac
+  if [ "$dns_hijack_tcp" = false ] && [ "$dns_hijack_udp" = false ]; then
+    dns_hijack_mode=disable
+    mihomo_dns_forward=disable
+  fi
+  return 0
+}
+
+mfr_dns_override() {
+  local input="$1" output="$2" from
+  MFR_DNS_LISTEN="$mfr_dns_address" "$bin_dir/yq" -i '.dns.listen = strenv(MFR_DNS_LISTEN)' "$output" || return 1
+  if [ "${adguardhome_enabled:-false}" = true ]; then
+    "$bin_dir/yq" -i '.dns.enable = true | .tun."dns-hijack" = []' "$output"
+    return $?
+  fi
+  case "${dns_hijack_setting:-follow}" in
+    on) "$bin_dir/yq" -i '.dns.enable = true | .tun."dns-hijack" = ["any:53", "tcp://any:53"]' "$output" ;;
+    off) "$bin_dir/yq" -i '.tun."dns-hijack" = []' "$output" ;;
+    *)
+      from=$(mfr_dns_yaml "$input")
+      MFR_DNS_LIST="$("$bin_dir/yq" -o=json -I=0 '.tun."dns-hijack" // []' "$from")" \
+        "$bin_dir/yq" -i '.tun."dns-hijack" = (strenv(MFR_DNS_LIST) | from_json)' "$output"
+      ;;
+  esac
+}
+
+# Parse the primary connected station only; preserve spaces, quotes and commas
+# in SSIDs. Disabled/scanning Wi-Fi must not reuse a stale WifiInfo entry.
+mfr_wifi_parse() {
+  busybox awk '
+    /^Wifi is connected to "/ {s=$0; sub(/^Wifi is connected to "/,"",s); sub(/"\r?$/,"",s); connected=1}
+    /^WifiInfo: / && connected && /Supplicant state: COMPLETED/ {print s; exit}
+  '
+}
+
+mfr_current_ssid() {
+  local status
+  status=$(cmd wifi status 2>/dev/null) || return 1
+  printf '%s\n' "$status" | grep -q '^Wifi is ' || return 1
+  printf '%s\n' "$status" | mfr_wifi_parse
+}
+
+mfr_wifi_matches() {
+  local ssid="$1"
+  [ -n "$ssid" ] && [ -s "$preferences_file" ] || return 1
+  MFR_SSID="$ssid" "$bin_dir/yq" -e '.wifi_pause_enabled == true and
+    ((.wifi_pause_ssids // []) | contains([strenv(MFR_SSID)]))' "$preferences_file" >/dev/null 2>&1
+}
+
+# Pure state decision, also exercised without changing the phone network.
+mfr_policy_decision() {
+  local wanted="$1" disabled="$2" live="$3" paused="$4" matches="$5" explicit="$6"
+  if [ "$disabled" = true ] || [ "$wanted" != running ]; then
+    [ "$live" != true ] || { echo stop; return; }
+    echo idle
+  elif [ "$matches" = true ]; then
+    if [ "$live" = true ] || [ "$paused" = true ] || [ "$explicit" = true ]; then echo pause; else echo idle; fi
+  elif [ "$paused" = true ] || [ "$explicit" = true ]; then
+    echo start
+  else
+    echo idle
+  fi
+}

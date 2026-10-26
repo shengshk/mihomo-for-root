@@ -1,0 +1,113 @@
+#!/system/bin/sh
+if [ -z "${mfr_dns_port:-}" ] && [ -n "${box_dir:-}" ]; then . "$box_dir/scripts/ports.utils"; fi
+# GID isolates the root DNS daemon from Android netd and ordinary app queries.
+adg_paths() {
+  adg_dir="$box_dir/adguardhome"
+  adg_config="$adg_dir/AdGuardHome.yaml"
+  adg_pid="$box_run_state/adguardhome.pid"
+  adg_state="$box_run_state/adguardhome.upstream"
+  adg_error="$box_run_state/adguardhome.error"
+  adg_group=19054
+}
+adg_alive() {
+  local p
+  p=$(cat "$adg_pid" 2>/dev/null)
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null && grep -q '/bin/AdGuardHome' "/proc/$p/cmdline" 2>/dev/null
+}
+adg_core_alive() {
+  local p
+  p=$(cat "$box_pid" 2>/dev/null)
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null && grep -q '/bin/mihomo' "/proc/$p/cmdline" 2>/dev/null
+}
+adg_dns_ready() {
+  # Readiness is the core's own bound DNS socket, not a known-public-IP test:
+  # a working Fake-IP resolver intentionally returns synthetic addresses.
+  local p inode fd target
+  p=$(cat "$box_pid" 2>/dev/null)
+  adg_core_alive || return 1
+  for inode in $(busybox awk -v endpoint="0100007F:$mfr_dns_hex" '$2 == endpoint {print $10}' "/proc/$p/net/udp" 2>/dev/null); do
+    for fd in /proc/"$p"/fd/*; do
+      target=$(readlink "$fd" 2>/dev/null)
+      [ "$target" != "socket:[$inode]" ] || return 0
+    done
+  done
+  return 1
+}
+# Diagnostics survive recovery/cleanup; no request bodies, replies or query args.
+adg_diagnostic() (
+  umask 077
+  local file="$box_run/adguardhome-events.log" size
+  mkdir -p "$box_run" || exit 0
+  size=$(busybox stat -c %s "$file" 2>/dev/null)
+  if [ "${size:-0}" -gt 65536 ]; then
+    busybox tail -c 32768 "$file" > "$file.$$.tmp" && mv "$file.$$.tmp" "$file"
+  fi
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$file"
+  chmod 600 "$file"
+  exit 0
+)
+adg_api() {
+  local method="$1" path="$2"
+  shift 2
+  local curl_bin=/system/bin/curl error_file result=0 detail
+  [ -x "$curl_bin" ] || curl_bin="$bin_dir/curl"
+  error_file=$(mktemp "$box_run/.adg-api.XXXXXXXX") || return 1
+  "$curl_bin" --silent --show-error --fail --noproxy '*' --connect-timeout 1 --max-time 12 \
+    --request "$method" --header 'Content-Type: application/json' "$@" "http://127.0.0.1:9092/control/$path" 2>"$error_file" || result=$?
+  if [ "$result" -ne 0 ]; then
+    detail=$(busybox head -c 512 "$error_file" | busybox tr '\r\n' '  ')
+    adg_diagnostic "api $method ${path%%\?*} exit=$result $detail"
+  fi
+  rm -f "$error_file"
+  return "$result"
+}
+
+# Read only live API state. The IPv6 DNS transport guard is separate from AAAA
+# answer filtering; never infer the latter from ip6tables or the daemon PID.
+adg_status() {
+  local directory="$1" network_file="$2" running=false available=false upstream=unknown aaaa=unknown message
+  local info="$1/adg-dns.json" probe="$1/adg-aaaa.json"
+  message=$(cat "$adg_error" 2>/dev/null)
+  if adg_alive; then
+    running=true
+    if adg_api GET dns_info > "$info" && "$bin_dir/yq" -e '.upstream_dns | tag == "!!seq"' "$info" >/dev/null 2>&1; then
+      available=true
+      if MFR_MIHOMO_DNS="$mfr_dns_address" "$bin_dir/yq" -e '(.upstream_dns_file // "") == "" and (.upstream_dns | length) == 1 and .upstream_dns[0] == strenv(MFR_MIHOMO_DNS)' "$info" >/dev/null 2>&1; then
+        upstream=mihomo
+      elif MFR_NETWORK_DNS="$network_file" "$bin_dir/yq" -e '(.upstream_dns_file // "") == "" and
+        (load(strenv(MFR_NETWORK_DNS)) | length > 0) and
+        (.upstream_dns | sort | join("|")) == (load(strenv(MFR_NETWORK_DNS)) | sort | join("|"))' "$info" >/dev/null 2>&1; then
+        upstream=system
+      elif "$bin_dir/yq" -e '(.upstream_dns | length) == 1 and .upstream_dns[0] == "127.0.0.1:1"' "$info" >/dev/null 2>&1; then
+        upstream=pending
+      else
+        upstream=other
+      fi
+      if [ "$("$bin_dir/yq" -r '.disable_ipv6' "$info")" = true ]; then
+        aaaa=enabled
+      elif adg_api GET 'filtering/check_host?name=mfr-aaaa-check.invalid&qtype=AAAA' > "$probe" &&
+           "$bin_dir/yq" -e 'has("reason")' "$probe" >/dev/null 2>&1; then
+        aaaa=disabled
+        if "$bin_dir/yq" -e '.reason == "RewriteRule" and
+          ([.rules[]?.text | select(contains("dnstype=AAAA") and contains("dnsrewrite=NOERROR;;"))] | length > 0)' "$probe" >/dev/null 2>&1; then
+          aaaa=enabled
+        fi
+      fi
+    fi
+  fi
+  MFR_ADG_RUNNING="$running" MFR_ADG_AVAILABLE="$available" MFR_ADG_UPSTREAM="$upstream" MFR_ADG_AAAA="$aaaa" \
+    MFR_ADG_ERROR="$message" MFR_ADG_CAPTURE="$(cat "$box_run_state/adguardhome.capture" 2>/dev/null)" "$bin_dir/yq" -n -o=json '
+    {"running":(strenv(MFR_ADG_RUNNING) == "true"),"api_available":(strenv(MFR_ADG_AVAILABLE) == "true"),
+     "upstream":strenv(MFR_ADG_UPSTREAM),"aaaa_filter":strenv(MFR_ADG_AAAA),
+     "error":strenv(MFR_ADG_ERROR),"capture":strenv(MFR_ADG_CAPTURE)}'
+}
+adg_health_needed() {
+  [ "${adguardhome_enabled:-false}" = true ] || return 1
+  [ ! -f /data/adb/modules/box_for_root/disable ] || return 0
+  adg_alive || return 0
+  local applied
+  IFS='|' read -r applied _ < "$adg_state" 2>/dev/null
+  if adg_core_alive; then [ "$applied" != mihomo ]; else [ "$applied" = mihomo ]; fi
+}

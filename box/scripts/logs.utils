@@ -1,0 +1,31 @@
+#!/system/bin/sh
+# Fixed files only; bound both bytes read and bytes returned before JSON encoding.
+mfr_log_tail() {
+  [ -f "$1" ] || return 0
+  busybox tail -c 65536 "$1" 2>/dev/null | busybox tail -n "$2"
+}
+mfr_log_read() {
+  case "$1" in
+    module) mfr_log_tail "$box_run/runs.log" 100 ;;
+    mihomo) mfr_log_tail "$box_run/mihomo.log" 100 ;;
+    agh)
+      mfr_log_tail "$box_run/adguardhome.log" 80
+      if [ -s "$box_run/adguardhome-events.log" ]; then
+        printf '\n[AGH 模块操作]\n'
+        mfr_log_tail "$box_run/adguardhome-events.log" 20
+      fi ;;
+    *) return 1 ;;
+  esac | busybox tail -n 100 | busybox awk '
+    {
+      line=$0
+      gsub(/\033\[[0-9;]*[A-Za-z]/, "", line)
+      if (tolower(line) ~ /authorization|cookie|password|passwd|pwd|secret|token|api[-_ ]?key/) {
+        line="[已隐藏敏感信息]"
+      } else {
+        gsub(/[A-Za-z][A-Za-z0-9+.-]*:\/\/[^[:space:]"<>]+/, "[链接已隐藏]", line)
+      }
+      if (length(line)>2048) line=substr(line,1,2048) "…"
+      if (bytes+length(line)+1>32768) exit
+      print line; bytes+=length(line)+1
+    }'
+}

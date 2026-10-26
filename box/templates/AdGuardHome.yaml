@@ -1,0 +1,53 @@
+schema_version: 34
+# Public defaults. The module enables this service only through phone preferences.
+http:
+  address: 127.0.0.1:9092
+users: []
+dns:
+  bind_hosts: [127.0.0.1]
+  port: 1054
+  # A closed local port prevents AGH from selecting public/system defaults before
+  # the module supplies the actual current upstream through its API.
+  upstream_dns: ['127.0.0.1:1']
+  upstream_dns_file: ''
+  bootstrap_dns: []
+  fallback_dns: []
+  use_private_ptr_resolvers: false
+  local_ptr_upstreams: []
+  use_dns64: false
+  aaaa_disabled: false
+  cache_enabled: false
+  cache_optimistic: false
+  # Bytes: 1 MiB. These values also apply when the cache is enabled later.
+  cache_size: 1048576
+  cache_ttl_min: 600
+  cache_ttl_max: 3600
+  ratelimit: 0
+  refuse_any: true
+  hostsfile_enabled: false
+  resolve_clients: false
+filtering:
+  protection_enabled: true
+  filtering_enabled: true
+  filters_update_interval: 24
+filters:
+  - enabled: false
+    url: https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt
+    name: AdBlock DNS
+    id: 217
+whitelist_filters: []
+user_rules:
+  - '! 仅允许指定域名及其子域名查询 AAAA。'
+  - '! 替换示例域名后，删除规则前的“! ”启用。'
+  - '! $dnstype=AAAA,denyallow=example.com|example.net,dnsrewrite=NOERROR;;'
+querylog:
+  enabled: true
+  interval: 24h
+statistics:
+  enabled: true
+  interval: 24h
+log:
+  file: ''
+  max_size: 1
+  max_backups: 1
+  compress: false

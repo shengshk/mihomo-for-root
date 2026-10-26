@@ -1,0 +1,603 @@
+#!/system/bin/sh
+
+scripts_dir="${0%/*}"
+source /data/adb/box/settings.ini
+. "${scripts_dir}/dns.utils"
+. "${scripts_dir}/profile.utils"
+. "${scripts_dir}/apps.utils"
+. "${scripts_dir}/adg.utils"
+. "${scripts_dir}/status.utils"
+box_dns_paths
+
+PROPFILE="/data/adb/modules/box_for_root/module.prop"
+
+sed_file_if_changed() {
+  local file="$1"
+  shift
+
+  local temp_file="${box_run_state}/.${file##*/}.$$.tmp"
+  mkdir -p "${box_run_state}" >/dev/null 2>&1 || true
+  sed "$@" "${file}" > "${temp_file}" || {
+    rm -f "${temp_file}" >/dev/null 2>&1 || true
+    return 1
+  }
+
+  if busybox cmp -s "${temp_file}" "${file}"; then
+    rm -f "${temp_file}" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  mv "${temp_file}" "${file}"
+}
+
+find_packages_uid() {
+  log Info "代理模式: ${proxy_mode}"
+
+  if [ "${proxy_mode}" = "core" ]; then
+    log Info "核心模式已启用，跳过 package 和 gid 处理"
+    > "${uid_list}"
+    return 0
+  fi
+
+  log Info "开始处理 UID/GID 列表"
+  log Debug "应用清单: ${#packages_list[@]} 项"
+  > "${uid_list}"
+
+  local packages_file
+  packages_file="${system_packages_file:-/data/system/packages.list}"
+  mkdir -p "${box_run_state}" >/dev/null 2>&1 || true
+  if [ -f "${packages_file}" ]; then
+    # Android mksh printf is external. Use its builtin print once, avoiding
+    # thousands of process launches and exec argument limits for large lists.
+    {
+      if [ -n "${KSH_VERSION:-}" ]; then
+        print -r -- "${packages_list[@]}"
+      else
+        printf '%s\n' "${packages_list[@]}"
+      fi
+    } | busybox awk '
+      FILENAME == ARGV[1] {if ($2 ~ /^[0-9]+$/) uid[$1]=$2; next}
+      {
+        for (i=1; i<=NF; i++) {
+          package=$i; prefix=0; colon=index(package, ":")
+          if (colon) {
+            prefix=substr(package, 1, colon-1)
+            package=substr(package, colon+1)
+            if (prefix !~ /^[0-9]+$/) prefix=0
+          }
+          if (package in uid) print uid[package] + prefix * 100000
+        }
+      }
+    ' "${packages_file}" - >> "${uid_list}" || return 1
+  else
+    log Warning "Failure: packages.list 不存在: ${packages_file}"
+  fi
+
+  if [ ${#gid_list[@]} -gt 0 ]; then
+    printf "%s\n" "${gid_list[@]}" >> "${uid_list}"
+    log Debug "GID: ${gid_list[*]} -> 已添加"
+  fi
+
+  if [ -s "${uid_list}" ]; then
+    local temp_uid_list="${box_run_state}/temp_uid.list"
+    busybox sort -un "${uid_list}" > "${temp_uid_list}"
+    mv "${temp_uid_list}" "${uid_list}"
+    local uid_count=$(busybox wc -l < "${uid_list}")
+    log Info "UID/GID 列表处理完成: ${uid_count} 条"
+  fi
+}
+
+log_service_results() {
+    local core_name="$1"
+    local proxy_mode_type="$2"
+    local uids="$3"
+
+    log Info "更新TUN模式UID列表: 模式=${proxy_mode_type}"
+    [ -n "$uids" ] && log Debug "UIDs: ${uids}"
+}
+
+box_permission_stamp_path() {
+  printf '%s/permission.%s.stamp\n' "${box_run_state}" "${bin_name}"
+}
+
+box_permission_stamp_value() {
+  local bin_stat core_dir_stat yq_stat curl_stat
+
+  bin_stat="$(busybox stat -c '%u:%g:%a:%s:%Y' "${bin_path}" 2>/dev/null)"
+  core_dir_stat="$(busybox stat -c '%u:%g:%a:%Y' "${box_dir}/${bin_name}" 2>/dev/null)"
+  yq_stat="$(busybox stat -c '%u:%g:%a:%s:%Y' "${box_dir}/bin/yq" 2>/dev/null)"
+  curl_stat="$(busybox stat -c '%u:%g:%a:%s:%Y' "${box_dir}/bin/curl" 2>/dev/null)"
+
+  printf '%s|%s|%s|%s|%s|%s\n' "${box_user_group}" "${bin_path}" "${bin_stat}" "${core_dir_stat}" "${yq_stat}" "${curl_stat}"
+}
+
+box_permission_stamp_valid() {
+  local stamp_file current_stamp old_stamp
+
+  stamp_file="$(box_permission_stamp_path)"
+  [ -f "${stamp_file}" ] || return 1
+
+  current_stamp="$(box_permission_stamp_value)"
+  old_stamp="$(cat "${stamp_file}" 2>/dev/null)"
+  [ -n "${current_stamp}" ] && [ "${current_stamp}" = "${old_stamp}" ]
+}
+
+box_permission_stamp_save() {
+  mkdir -p "${box_run_state}" >/dev/null 2>&1 || true
+  box_permission_stamp_value > "$(box_permission_stamp_path)" 2>/dev/null
+}
+
+box_ownership() {
+  # 设置内核目录权限和属主
+  chown "${box_user_group}" "${box_dir}/mihomo"
+  find "${box_dir}/mihomo" -maxdepth 1 -type f -name "*.yaml" -exec chmod 600 {} \;
+
+  chown "${box_user_group}" "${bin_path}"
+  chmod 0755 "${bin_path}"
+
+  chmod 0700 "${box_dir}/bin/yq"
+  chmod 0700 "${box_dir}/bin/curl"
+}
+
+box_permission() {
+  if [[ "${box_user_group}" == @(root:net_admin|0:3005) && -f "${bin_path}" ]]; then
+    # 设置内核目录权限和属主
+    if box_permission_stamp_valid; then
+      log Debug "权限未变化，跳过递归权限修正"
+    else
+      box_ownership
+      box_permission_stamp_save || true
+    fi
+    log Info "使用内核 ${bin_path}。"
+  else
+    if  [[ "${box_user_group}" != @(root:net_admin|0:3005) ]]; then
+      log Error "不支持的用户组 [ \"${box_user_group}\" ]"
+      sed -i "s/box_user_group=.*/box_user_group=\"root:net_admin\"/g" "${settings}"
+      log Debug "已自动切换为 [ root:net_admin ]，请重启 box"
+      exit 1
+    fi
+    log Error "未检测到内核 [ \"${bin_name}\" ]。"
+    log Error "请下载 [ \"${bin_name}\" ] 内核并放置到 \"${bin_dir}/\" 目录下。"
+    log Debug "可在终端执行 'su -c \"${scripts_dir}/box.tool upkernel\"' 下载内核"
+    set_description error "内核不存在"
+    exit 1
+  fi
+}
+
+box_check_bin() {
+  if [ ! -x "${bin_path}" ]; then
+    log Error "${bin_path} 不可执行。"
+    set_description error "内核不可执行"
+    exit 1
+  fi
+
+  local version_output
+  case "${bin_name}" in
+    mihomo)
+      version_output=$("${bin_path}" -v 2>/dev/null) || {
+        log Error "${bin_name} 版本信息获取失败。"
+        set_description error "内核损坏"
+        exit 1
+        }
+      ;;
+    *)
+      version_output=$("${bin_path}" version 2>/dev/null) || {
+        log Error "${bin_name} 版本信息获取失败。"
+        set_description error "内核损坏"
+        exit 1
+        }
+      ;;
+  esac
+
+  log Info "${version_output}"
+}
+
+tun_requires_manual_routing() {
+  [[ "${network_mode}" == @(mixed|tun) ]] && [ "${bypass_cn_ip}" = "true" ]
+}
+
+tun_should_force_gvisor() {
+  [[ "${network_mode}" == @(mixed|tun) ]] && [ "${bypass_cn_ip}" = "true" ]
+}
+
+tun_should_manage_core_config() {
+  [[ "${network_mode}" == @(mixed|tun) ]] && [ "${bypass_cn_ip}" = "true" ]
+}
+
+tun_auto_flag_value() {
+  if tun_requires_manual_routing; then
+    printf 'false\n'
+  else
+    printf 'true\n'
+  fi
+}
+
+tun_effective_stack() {
+  if tun_should_force_gvisor; then
+    printf 'gvisor\n'
+  elif [ -n "${stack}" ]; then
+    printf '%s\n' "${stack}"
+  else
+    printf 'mixed\n'
+  fi
+}
+
+force_network_mode() {
+  local target_mode="$1"
+  local reason="$2"
+
+  [ -n "${target_mode}" ] || return 1
+  [ "${network_mode}" = "${target_mode}" ] && return 0
+
+  [ -n "${reason}" ] && log Warning "${reason}"
+  sed -i 's/\(network_mode=\)"[^"]*"/\1"'"${target_mode}"'"/g' "${settings}"
+  network_mode="${target_mode}"
+}
+
+prepare_mihomo() {
+  # 检查配置文件
+  if ! [ -f "${mihomo_config}" ]; then
+    log Error "未找到配置文件 ${mihomo_config}"
+    set_description error "配置文件不存在"
+    exit 1
+  else
+    log Info "检测到配置 ${mihomo_config}"
+  fi
+
+  # 写入 external_controller，如未配置
+  mihomo_external_controller=$(busybox awk '!/^ *#/ && /external-controller: /{print $1}' "${mihomo_config}")
+  if [ -z "${mihomo_external_controller}" ]; then
+    printf "\nexternal-controller: 0.0.0.0:9090" >> "${mihomo_config}"
+  fi
+
+  # 写入 external_ui，如未配置
+  mihomo_external_ui=$(busybox awk '!/^ *#/ && /external-ui: /{print $1}' "${mihomo_config}")
+  if [ -z "${mihomo_external_ui}" ]; then
+    printf "\nexternal-ui: ./dashboard" >> "${mihomo_config}"
+  fi
+
+  # 写入 tproxy-port，如未配置
+  mihomo_tproxy_port=$(busybox awk '!/^ *#/ && /tproxy-port: /{print $1}' "${mihomo_config}")
+  if [ -z "${mihomo_tproxy_port}" ]; then
+    printf "\ntproxy-port: ${tproxy_port}" >> "${mihomo_config}"
+  fi
+
+  # 写入 redir-port，如未配置
+  mihomo_redir_port=$(busybox awk '!/^ *#/ && /redir-port: /{print $1}' "${mihomo_config}")
+  if [ -z "${mihomo_redir_port}" ]; then
+    printf "\nredir-port: ${redir_port}" >> "${mihomo_config}"
+  fi
+
+  if [[ "${network_mode}" == @(mixed|tun) ]]; then
+    # 当 TUN + CNIP 由 box.iptables 接管策略路由时，这里只同步 tun 开关，不再让 Mihomo 自动写路由。
+    local mihomo_tun_auto_route
+    local mihomo_tun_strict_route
+    local mihomo_tun_auto_redirect
+    local mihomo_tun_auto_detect_interface
+    local mihomo_tun_stack
+    mihomo_tun_auto_route="$(tun_auto_flag_value)"
+    mihomo_tun_strict_route="$(tun_auto_flag_value)"
+    mihomo_tun_auto_redirect="$(tun_auto_flag_value)"
+    mihomo_tun_auto_detect_interface="$(tun_auto_flag_value)"
+    mihomo_tun_stack="$(tun_effective_stack)"
+    stack="${mihomo_tun_stack}"
+    if tun_should_force_gvisor; then
+      log Info "检测到 TUN + 大陆IP分流，已将 mihomo 协议栈调整为 gvisor。"
+    fi
+    mihomo_tun_status=$(busybox awk '!/^ *#/ && /tun:/ { getline; split($0, arr, ": "); print arr[2]; found=1; exit } END{ if (!found) print "" }' "${mihomo_config}" 2>/dev/null)
+    # 写入 TUN 配置，如未配置
+    if [ -z "${mihomo_tun_status}" ]; then
+      printf '%s\n' '' 'tun:' \
+        '  enable: true' \
+        '  mtu: 9000' \
+        '  device: meta' \
+        "  stack: ${mihomo_tun_stack} # / gvisor / system" \
+        '  dns-hijack:' \
+        '    - any:53' \
+        '    - tcp://any:53' \
+        "  auto-route: ${mihomo_tun_auto_route}" \
+        "  strict-route: ${mihomo_tun_strict_route}" \
+        "  auto-redirect: ${mihomo_tun_auto_redirect}" \
+        "  auto-detect-interface: ${mihomo_tun_auto_detect_interface}" \
+        '  include-android-user: [0, 10]' \
+        '  exclude-uid: []' \
+        '  include-uid: []' \ >> "${mihomo_config}"
+      log Debug "已为 ${mihomo_config} 添加 [tun] 配置"
+    else
+      log Info  "${mihomo_config} 已存在 [tun] 配置"
+    fi
+    # core 模式：跳过 UID 处理
+    if tun_should_manage_core_config; then
+      sed_file_if_changed "${mihomo_config}" -e "/^tun:/,/^[^ ]/ { s/^[[:space:]]*stack:.*/  stack: ${mihomo_tun_stack}/; s/^[[:space:]]*auto-route:.*/  auto-route: ${mihomo_tun_auto_route}/; s/^[[:space:]]*strict-route:.*/  strict-route: ${mihomo_tun_strict_route}/; s/^[[:space:]]*auto-redirect:.*/  auto-redirect: ${mihomo_tun_auto_redirect}/; s/^[[:space:]]*auto-detect-interface:.*/  auto-detect-interface: ${mihomo_tun_auto_detect_interface}/; }"
+    else
+      sed_file_if_changed "${mihomo_config}" -e "/^tun:/,/^[^ ]/ { s/^[[:space:]]*auto-route:.*/  auto-route: true/; s/^[[:space:]]*auto-detect-interface:.*/  auto-detect-interface: true/; }"
+      log Info "TUN 未启用大陆 IP 分流，保留 Mihomo 现有 TUN 路由与协议栈配置。"
+    fi
+
+    if [ "${proxy_mode}" = "core" ]; then
+      sed_file_if_changed "${mihomo_config}" -e "s/exclude-uid:.*/exclude-uid: []/g" \
+          -e "s/include-uid:.*/include-uid: []/g" \
+          -e "/tun:/,/enable:/ { /enable: false/ s/enable: false/enable: true/ }"
+      log_service_results "mihomo" "core" ""
+    else
+      # 为 tun 添加 include-uid/exclude-uid
+      if [ -f "${uid_list}" ]; then
+          list_uid=$(busybox tr '\n' ',' < "${uid_list}" | sed 's/,$//')
+      else
+          list_uid=""
+      fi
+
+      if [[ "${proxy_mode}" = "whitelist" || "${proxy_mode}" = "white" ]]; then
+        mode="include"
+      elif [[ "${proxy_mode}" = "blacklist" || "${proxy_mode}" = "black" ]]; then
+        mode="exclude"
+      fi
+
+      # 重置 include/exclude_uid 列表并启用 tun
+      sed_file_if_changed "${mihomo_config}" -e "s/exclude-uid:.*/exclude-uid: []/g" \
+          -e "s/include-uid:.*/include-uid: []/g" \
+          -e "/tun:/,/enable:/ { /enable: false/ s/enable: false/enable: true/ }"
+
+
+      # 检查 tun 块中是否有 include-uid/exclude-uid
+      uid_found=$(busybox awk '/^tun:/{f=1} f && /'"$mode-uid:"'/{print $0; exit}' "$mihomo_config")
+      if [ -z "$uid_found" ]; then
+          sed_file_if_changed "${mihomo_config}" "/^tun:/a \  $mode-uid: []"
+      fi
+
+      # 添加uid到配置
+      if [ -n "${list_uid}" ]; then
+        sed_file_if_changed "${mihomo_config}" "s/${mode}-uid:.*/${mode}-uid: [${list_uid}]/g"
+      fi
+      log_service_results "mihomo" "$mode" "$list_uid"
+    fi
+
+  else
+    sed_file_if_changed "${mihomo_config}" "/tun:/,/enable:/ { /enable: true/ s/enable: true/enable: false/ }"
+  fi
+
+  # 同步 tproxy/redir 端口
+  sed_file_if_changed "${mihomo_config}" -E "s/(tproxy-port: )[0-9]+/\1${tproxy_port}/"
+  sed_file_if_changed "${mihomo_config}" -E "s/(redir-port: )[0-9]+/\1${redir_port}/"
+
+  mihomo_enhanced_mode=$(busybox awk '!/^ *#/ && /enhanced-mode: / { print $2 }' "${mihomo_config}" 2>/dev/null)
+  if [ -z "${mihomo_enhanced_mode}" ]; then
+    # 添加 enhanced-mode: fake-ip
+    sed_file_if_changed "${mihomo_config}" "/^dns:/a \  enhanced-mode: fake-ip"
+    log Debug "已添加 enhanced-mode: fake-ip"
+  fi
+
+
+}
+
+prepare_mihomo_runtime() {
+  local source_config="${MFR_SOURCE_CONFIG:-$mihomo_config}"
+  local candidate="${box_dns_runtime}.next.$$"
+  local snapshot="${box_run_state}/network-dns.pending.$$"
+  umask 077
+  mkdir -p "$box_run_state"
+  find_packages_uid >/dev/null
+  if [ "$proxy_mode" = whitelist ] && [ ! -s "$uid_list" ]; then
+    return 1
+  fi
+  box_dns_snapshot > "$snapshot"
+  if ! mfr_expand_config "$source_config" "$candidate"; then
+    rm -f "$candidate" "$snapshot"
+    return 1
+  fi
+  mfr_tun_resolve "$candidate"
+  mihomo_config="$candidate"
+  if [ "$auto_modify_config" = true ]; then prepare_mihomo; fi
+  if ! mfr_dns_override "$source_config" "$candidate" ||
+     ! box_dns_apply "$candidate" "$snapshot" ||
+     ! "$bin_path" -t -d "$box_dir/mihomo" -f "$candidate" > "$box_run/network-dns-check.log" 2>&1; then
+    rm -f "$candidate" "$snapshot"
+    mihomo_config="$source_config"
+    return 1
+  fi
+  if [ "${MFR_CHECK_ONLY:-0}" = 1 ]; then
+    rm -f "$candidate" "$snapshot"
+    return 0
+  fi
+  chmod 600 "$candidate"
+  mv -f "$candidate" "$box_dns_runtime"
+  mv -f "$snapshot" "$box_run_state/network-dns.pending"
+  mihomo_config="$box_dns_runtime"
+}
+
+commit_network_dns_state() {
+  mfr_apps_signature > "$box_run_state/apps.applied.next" &&
+    mv "$box_run_state/apps.applied.next" "$box_run_state/apps.applied"
+  if [ -f "${box_run_state}/network-dns.pending" ]; then
+    mv -f "${box_run_state}/network-dns.pending" "$box_dns_state"
+    box_dns_log "applied $(cat "$box_dns_state")"
+  fi
+}
+
+reload_mihomo() {
+  [ "${bin_name}" = mihomo ] || return 1
+  pidof mihomo >/dev/null 2>&1 || return 1
+  local lock="${box_run_state}/network-dns.lock"
+  local previous="${box_dns_runtime}.previous"
+  if ! mkdir "$lock" 2>/dev/null; then
+    local owner modified now
+    owner=$(cat "$lock/pid" 2>/dev/null)
+    case "$owner" in
+      ''|*[!0-9]*)
+        modified=$(stat -c %Y "$lock" 2>/dev/null)
+        now=$(date +%s)
+        [ -n "$modified" ] && [ $((now - modified)) -gt 30 ] || return 0
+        ;;
+      *)
+        if kill -0 "$owner" 2>/dev/null && grep -q box.service "/proc/$owner/cmdline" 2>/dev/null; then return 75; fi
+        ;;
+    esac
+    rm -f "$lock/pid"
+    rmdir "$lock" 2>/dev/null && mkdir "$lock" 2>/dev/null || return 0
+  fi
+  printf '%s\n' "$$" > "$lock/pid"
+  trap "rm -f '$lock/pid'; rmdir '$lock' 2>/dev/null" EXIT
+  if [ -f "$box_dns_runtime" ]; then cp -p "$box_dns_runtime" "$previous"; fi
+  if ! prepare_mihomo_runtime; then return 1; fi
+  if box_dns_api_reload "$box_dns_runtime" "$previous"; then
+    commit_network_dns_state
+    rm -f "$previous"
+    set_description running
+    log Info 'Mihomo 运行配置已重载；DNS 解析器已更新。'
+    return 0
+  fi
+  [ ! -f "$previous" ] || mv -f "$previous" "$box_dns_runtime"
+  rm -f "${box_run_state}/network-dns.pending"
+  box_dns_log 'API reload failed; previous runtime restored'
+  return 1
+}
+
+wait_mihomo_dns() {
+  local process="$1" timeout="${2:-20}" waited=0
+  while kill -0 "$process" 2>/dev/null; do
+    adg_dns_ready && return 0
+    if grep -qE 'Start DNS server.*bind: address already in use' "$bin_log" 2>/dev/null; then
+      local owners
+      owners=$(mfr_dns_port_owners)
+      log Error "DNS 端口 $mfr_dns_port 被占用：${owners:-占用者未知}"
+      return 1
+    fi
+    [ "$waited" -lt "$timeout" ] || {
+      log Error "等待 Mihomo DNS 就绪超时（${timeout} 秒），详见 mihomo.log。"
+      return 1
+    }
+    sleep 1
+    waited=$((waited+1))
+  done
+  log Error 'Mihomo 启动期间退出，详见 mihomo.log。'
+  return 1
+}
+
+startup_adg_step() {
+  local phase="$1" attempt=1 result reason
+  while [ "$attempt" -le 3 ]; do
+    if [ "$phase" = sync ] && ! adg_core_alive; then
+      adg_diagnostic "startup phase=$phase aborted: core exited"
+      return 1
+    fi
+    result=0
+    MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" "$phase" || result=$?
+    if [ "$result" -eq 0 ]; then
+      [ "$attempt" -eq 1 ] || adg_diagnostic "startup phase=$phase recovered attempt=$attempt"
+      return 0
+    fi
+    reason="$(cat "$box_run_state/adguardhome.error" 2>/dev/null)"
+    [ "$result" -ne 75 ] || reason='操作锁占用'
+    adg_diagnostic "startup phase=$phase attempt=$attempt/3 exit=$result ${reason:-未知错误}"
+    log Warning "AGH ${phase} 失败（${attempt}/3，退出码 ${result}）。"
+    [ "$attempt" -lt 3 ] || return "$result"
+    sleep 1
+    attempt=$((attempt+1))
+  done
+}
+
+box_run_bin() {
+  ulimit -SHn 1000000 2>/dev/null || true
+  prepare_mihomo_runtime || {
+    log Error 'Mihomo 配置检查失败，详见 network-dns-check.log。'
+    return 1
+  }
+  if [ "${adguardhome_enabled:-false}" = true ] && [ -f "$scripts_dir/box.adg" ]; then
+    # Preparation can span a network handoff. Refresh the current system DNS
+    # before creating the new PID; an initializing core must not receive AGH yet.
+    startup_adg_step before-stop || {
+      log Error '启动前更新 AGH 系统 DNS 失败。'
+      return 1
+    }
+  fi
+  nohup busybox setuidgid "${box_user_group}" "${bin_path}" -d "${box_dir}/mihomo" -f "${box_dns_runtime}" > "${bin_log}" 2>&1 &
+  PID=$!
+  printf '%s' "$PID" > "$box_pid"
+  if [ "${adguardhome_enabled:-false}" = true ] || [ "$("$box_dns_yq" -r '.dns.enable' "$box_dns_runtime" 2>/dev/null)" = true ]; then
+    wait_mihomo_dns "$PID" || return 1
+  else
+    sleep 1
+    kill -0 "$PID" 2>/dev/null || { log Error 'Mihomo 启动期间退出，详见 mihomo.log。'; return 1; }
+  fi
+  if [ -f "$scripts_dir/box.adg" ]; then
+    startup_adg_step sync || {
+      log Error 'AGH 切换至 Mihomo DNS 失败。'
+      return 1
+    }
+  fi
+  commit_network_dns_state
+  "${scripts_dir}/box.dns" start
+}
+
+box_bin_status() {
+  if busybox pidof mihomo >/dev/null; then
+    set_description running
+    log Info "Mihomo 正在运行，接管方式：${network_mode}"
+  else
+    set_description stopped
+    log Info "Mihomo 已停止"
+  fi
+}
+
+set_description() {
+  mfr_refresh_description "$1"
+}
+
+start_box() {
+  box_permission || return 1
+  box_check_bin || return 1
+  if ! box_run_bin; then
+    set_description error
+    return 1
+  fi
+  set_description running
+  log Info "Mihomo 已启动"
+}
+
+stop_box() {
+  [ ! -f "$scripts_dir/box.adg" ] || MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" before-stop || log Warn "AGH 上游切换失败"
+  "${scripts_dir}/box.dns" stop >/dev/null 2>&1
+  local process
+  process=$(cat "$box_pid" 2>/dev/null)
+  case "$process" in
+    ''|*[!0-9]*) ;;
+    *)
+      if kill -0 "$process" 2>/dev/null && grep -q '/bin/mihomo' "/proc/$process/cmdline" 2>/dev/null; then
+        kill -15 "$process" 2>/dev/null
+        local count=0
+        while kill -0 "$process" 2>/dev/null && [ "$count" -lt 5 ]; do
+          sleep 1
+          count=$((count+1))
+        done
+        kill -0 "$process" 2>/dev/null && kill -9 "$process" 2>/dev/null
+      fi
+      ;;
+  esac
+  rm -f "$box_pid"
+  set_description stopped
+  return 0
+}
+
+case "$1" in
+  start)
+    stop_box >/dev/null 2>&1
+    start_box || exit 1
+    ;;
+  stop) stop_box ;;
+  restart)
+    "${scripts_dir}/box.iptables" disable >/dev/null 2>&1 || exit 1
+    stop_box >/dev/null 2>&1
+    start_box || exit 1
+    "${scripts_dir}/box.iptables" renew >/dev/null 2>&1 || exit 1
+    ;;
+  reload) reload_mihomo ;;
+  validate)
+    MFR_SOURCE_CONFIG="$2"
+    MFR_CHECK_ONLY=1
+    prepare_mihomo_runtime
+    ;;
+  prepare) prepare_mihomo_runtime ;;
+  describe) mfr_refresh_description ;;
+  status) box_bin_status ;;
+  *) printf '%s\n' '用法: box.service start|stop|restart|reload|validate|prepare|status' >&2; exit 1 ;;
+esac

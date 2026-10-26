@@ -1,0 +1,107 @@
+#!/system/bin/sh
+# Functions shared by box.service and box.dns. Source YAML is never edited here.
+
+box_dns_paths() {
+  box_dns_state="${box_run_state}/network-dns.state"
+  box_dns_runtime="${box_dir}/mihomo/.box-runtime.yaml"
+  box_dns_yq="${bin_dir}/yq"
+}
+
+# Read only the current NetworkAgentInfo record, not historical network logs.
+# Android exposes cellular and Wi-Fi records together even when Wi-Fi is default.
+box_dns_parse_network() {
+  awk '
+    function ipv4(s, a, n, i) {
+      n=split(s,a,"."); if(n!=4) return 0
+      for(i=1;i<=4;i++) if(a[i] !~ /^[0-9]+$/ || a[i]+0>255) return 0
+      return a[1]+0>0 && a[1]+0!=127 && a[1]+0<224
+    }
+    /Active default network:/ { active=$NF; next }
+    /^[[:space:]]*NetworkAgentInfo[[:space:]]*\{/ {
+      record=($0 ~ "network\\{" active "\\}");
+    }
+    record && /InterfaceName:/ && /DnsAddresses:/ {
+      line=$0; sub(/^.*InterfaceName:[[:space:]]*/,"",line)
+      split(line,parts,/[[:space:]}]/); interface=parts[1]
+      line=$0; sub(/^.*DnsAddresses:[[:space:]]*\[/,"",line)
+      sub(/\].*$/,"",line); n=split(line,addresses,/[[:space:],]+/)
+      dns=""
+      for(i=1;i<=n;i++) {
+        value=addresses[i]; sub(/^\//,"",value)
+        if(ipv4(value) && !seen[value]++) dns=dns (dns==""?"":" ") value
+      }
+      found=1; record=0
+    }
+    END {
+      if(active ~ /^[0-9]+$/ && found && interface !~ /^(lo|tun[0-9]*|utun[0-9]*|meta)$/)
+        print active "|" interface "|" dns
+      else print "none||"
+    }
+  '
+}
+
+box_dns_snapshot() {
+  if [ "${follow_network_dns:-false}" != "true" ]; then
+    printf '%s\n' disabled
+  else
+    printf 'enabled|'
+    dumpsys connectivity 2>/dev/null | box_dns_parse_network
+  fi
+}
+
+box_dns_log() {
+  local target="${box_run}/network-dns.log"
+  if [ -f "$target" ] && [ "$(wc -c < "$target")" -gt 65536 ]; then
+    tail -n 150 "$target" > "${target}.tmp" && mv "${target}.tmp" "$target"
+  fi
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$target"
+}
+
+box_dns_apply() {
+  local file="$1" snapshot="$2" mode netid interface servers json="" ip
+  IFS='|' read -r mode netid interface servers < "$snapshot"
+  [ "$mode" = enabled ] && [ -n "$servers" ] || return 0
+  for ip in $servers; do
+    json="${json}${json:+,}\"${ip}\""
+  done
+  BOX_NETWORK_DNS_JSON="[$json]" "$box_dns_yq" eval -i '
+    .dns."proxy-server-nameserver" = (.dns."proxy-server-nameserver" // .dns.nameserver) |
+    .dns.nameserver = ((.dns.nameserver // []) + env(BOX_NETWORK_DNS_JSON) | unique) |
+    .dns."direct-nameserver" = (((.dns."direct-nameserver" | select(length > 0)) // .dns.nameserver) + env(BOX_NETWORK_DNS_JSON) | unique)
+  ' "$file"
+}
+
+box_dns_api_get() {
+  local path="$1" config="$box_dns_runtime" port secret
+  [ -s "$config" ] || config="$mihomo_config"
+  port=$("$box_dns_yq" -r '."external-controller" // ""' "$config")
+  port=${port##*:}
+  case "$port" in ''|*[!0-9]*) return 1 ;; esac
+  secret=$("$box_dns_yq" -r '.secret // ""' "$config")
+  printf 'Authorization: Bearer %s\n' "$secret" |
+    /system/bin/curl --silent --fail --noproxy '*' --connect-timeout 1 --max-time 2 --header @- "http://127.0.0.1:$port$path" 2>/dev/null
+}
+
+box_dns_api_reload() {
+  local config="$1" auth_config="${2:-$1}" controller port secret http_code curl_bin
+  [ -f "$auth_config" ] || auth_config="$config"
+  controller=$("$box_dns_yq" -r '."external-controller" // ""' "$auth_config")
+  port=${controller##*:}
+  case "$port" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$port" -gt 0 ] && [ "$port" -le 65535 ] || return 1
+  secret=$("$box_dns_yq" -r '.secret // ""' "$auth_config")
+  curl_bin=$(command -v curl 2>/dev/null)
+  [ -n "$curl_bin" ] || curl_bin="${bin_dir}/curl"
+  [ -x "$curl_bin" ] || return 1
+  # Keep credentials out of the process arguments and log output.
+  http_code=$(
+    printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "$secret" |
+      "$curl_bin" --silent --show-error --noproxy '*' --connect-timeout 2 --max-time 20 \
+        --header @- --request PUT \
+        --data-binary "{\"path\":\"${config}\"}" \
+        --output "${box_run_state}/network-dns-api-response" --write-out '%{http_code}' \
+        "http://127.0.0.1:${port}/configs?force=false" 2>/dev/null
+  ) || return 1
+  [ "$http_code" = 204 ]
+}
+

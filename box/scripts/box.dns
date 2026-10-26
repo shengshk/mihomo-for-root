@@ -1,0 +1,85 @@
+#!/system/bin/sh
+
+scripts_dir="${0%/*}"
+. /data/adb/box/settings.ini
+. "${scripts_dir}/dns.utils"
+. "${scripts_dir}/network.events"
+box_dns_paths
+mkdir -p "$box_run_state"
+umask 077
+watch_pid="${box_run_state}/network-dns.pid"
+
+watcher_alive() {
+  local p
+  p=$(cat "$watch_pid" 2>/dev/null)
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null && grep -q 'box.dns' "/proc/$p/cmdline" 2>/dev/null
+}
+
+cleanup() {
+  if [ "${dns_operation_lock:-false}" = true ]; then
+    rm -f "$manage_dir/operation.lock/pid"
+    rmdir "$manage_dir/operation.lock" 2>/dev/null
+  fi
+  mfr_events_close
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+refresh() {
+  local first second previous
+  [ "${bin_name}" = mihomo ] || return 0
+  pidof mihomo >/dev/null 2>&1 || return 0
+  [ ! -f /data/adb/modules/box_for_root/disable ] || return 0
+  first=$(box_dns_snapshot)
+  previous=$(cat "$box_dns_state" 2>/dev/null)
+  [ "$first" != "$previous" ] || return 0
+  sleep 1
+  . /data/adb/box/settings.ini
+  second=$(box_dns_snapshot)
+  [ "$first" = "$second" ] || return 0
+  # Serialize with settings/core/app changes; unchanged DNS never takes a lock.
+  mkdir "$manage_dir/operation.lock" 2>/dev/null || return 75
+  dns_operation_lock=true
+  printf '%s\n' "$$" > "$manage_dir/operation.lock/pid"
+  "${scripts_dir}/box.service" reload >/dev/null 2>&1
+  result=$?
+  rm -f "$manage_dir/operation.lock/pid"
+  rmdir "$manage_dir/operation.lock" 2>/dev/null
+  dns_operation_lock=false
+  return "$result"
+}
+
+case "$1" in
+  start)
+    if ! watcher_alive; then
+      nohup /system/bin/sh "$0" watch </dev/null >/dev/null 2>&1 &
+    fi
+    ;;
+  stop)
+    if watcher_alive; then
+      kill "$(cat "$watch_pid")" 2>/dev/null
+      count=0
+      while watcher_alive && [ "$count" -lt 30 ]; do sleep 0.1; count=$((count + 1)); done
+    fi
+    ;;
+  watch)
+    watcher_alive && exit 0
+    printf '%s\n' "$$" > "$watch_pid"
+    trap 'cleanup; [ "$(cat "$watch_pid" 2>/dev/null)" != "$$" ] || rm -f "$watch_pid"' EXIT
+    mfr_events_open dns || exit 1
+    while pidof mihomo >/dev/null 2>&1; do
+      . /data/adb/box/settings.ini
+      refresh
+      mfr_events_ensure
+      mfr_events_wait "$(mfr_network_interval)"
+    done
+    ;;
+  refresh) refresh ;;
+  status)
+    printf 'follow_network_dns=%s\n' "${follow_network_dns:-false}"
+    printf 'current='; box_dns_snapshot
+    printf 'applied='; cat "$box_dns_state" 2>/dev/null
+    ;;
+  *) printf 'Usage: %s start|stop|refresh|status\n' "$0"; exit 1 ;;
+esac

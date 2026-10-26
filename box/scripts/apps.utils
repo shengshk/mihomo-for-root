@@ -1,0 +1,43 @@
+#!/system/bin/sh
+
+mfr_apps_signature() {
+  local key
+  case "$proxy_mode" in whitelist|white) key=include_apps ;; blacklist|black) key=exclude_apps ;; *) echo all; return ;; esac
+  [ -s "$system_packages_file" ] || return 1
+  printf '%s\n' "$key"
+  "$bin_dir/yq" -r ".${key}[]" "$preferences_file" | busybox awk '
+    NR == FNR {uid[$1]=$2; next} ($0 in uid) {print uid[$0]}
+  ' "$system_packages_file" - | busybox sort -un
+}
+
+mfr_apps_parse_list() {
+  local input="$1" output="$2"
+  "$bin_dir/yq" -e '.payload | tag == "!!seq"' "$input" >/dev/null 2>&1 || return 1
+  "$bin_dir/yq" -o=json '{"packages": ([.payload[] | select(tag == "!!str") |
+    select(test("^PROCESS-NAME,[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+$")) | split(",")[1]] | unique)}' "$input" > "$output" || return 1
+  "$bin_dir/yq" -e '.packages | length > 0 and length <= 20000' "$output" >/dev/null 2>&1
+}
+
+mfr_apps_parse_proxy_list() {
+  local input="$1" output="$2" lines="${2}.lines"
+  busybox awk '
+    {sub(/\r$/, ""); gsub(/^[ \t]+|[ \t]+$/, "")}
+    /^$/ || /^#/ || $0 == "android" {next}
+    $0 !~ /^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$/ {bad=1; exit}
+    !seen[$0]++ {print; count++}
+    END {if (bad || count == 0 || count > 20000) exit 1}
+  ' "$input" > "$lines" || { rm -f "$lines"; return 1; }
+  MFR_PACKAGE_LINES="$lines" "$bin_dir/yq" -n -o=json '{"packages":(load_str(strenv(MFR_PACKAGE_LINES)) | split("\n") | map(select(length > 0)))}' > "$output"
+  local result=$?
+  rm -f "$lines"
+  return "$result"
+}
+
+# Count packages, not unique UIDs; this does not load labels or run package RPCs.
+mfr_apps_counts() {
+  "$bin_dir/yq" -r '(.include_apps[] | "include|" + .), (.exclude_apps[] | "exclude|" + .)' "$preferences_file" | busybox awk '
+    FILENAME == ARGV[1] {installed[$1]=1; next}
+    {split($0,a,"|"); if ((a[2] in installed) && !seen[$0]++) count[a[1]]++}
+    END {printf "{\"include\":%d,\"exclude\":%d}\n",count["include"],count["exclude"]}
+  ' "$system_packages_file" -
+}

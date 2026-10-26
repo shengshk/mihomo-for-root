@@ -1,0 +1,613 @@
+#!/system/bin/sh
+# Private JSON interface for the module WebUI. Payloads travel in the environment,
+# never in command arguments or command logs. All writes use root-only storage.
+umask 077
+scripts_dir="${0%/*}"
+. /data/adb/box/settings.ini
+. "$scripts_dir/dns.utils"
+. "$scripts_dir/apps.utils"
+. "$scripts_dir/profile.utils"
+. "$scripts_dir/logs.utils"
+. "$scripts_dir/cron.utils"
+. "$scripts_dir/adg.utils"
+. "$scripts_dir/adg-controls.utils"
+. "$scripts_dir/status.utils"
+adg_paths
+box_dns_paths
+yq="$bin_dir/yq"
+db="$manage_dir/profiles.json"
+mkdir -p "$manage_dir/profiles" "$manage_dir/uploads"
+
+fail() { printf '%s\n' "$1" >&2; exit 1; }
+ok() { printf '{"ok":true}\n'; }
+running() {
+  local p
+  p=$(cat "$box_pid" 2>/dev/null)
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null && grep -q '/bin/mihomo' "/proc/$p/cmdline" 2>/dev/null
+}
+
+initialize() {
+  if [ ! -s "$preferences_file" ]; then
+    MFR_DNS="$follow_network_dns" MFR_MODE="$routing_mode" "$yq" -n -o=json '
+      {"tun_mode":"follow", "dns_mode":"follow", "ipv6_mode":"follow", "append_network_dns":(strenv(MFR_DNS) == "true"),
+       "routing_mode":strenv(MFR_MODE), "dns_hijack_mode":"follow", "adguardhome_enabled":false, "wifi_pause_enabled":false, "wifi_pause_ssids":[],
+       "app_mode": "all", "include_apps":[], "exclude_apps":[]}
+    ' > "$preferences_file"
+  fi
+  if [ "$("$yq" 'has("routing_mode")' "$preferences_file")" != true ]; then
+    MFR_ROUTING_MODE="$routing_mode" "$yq" -i '.routing_mode = strenv(MFR_ROUTING_MODE)' "$preferences_file"
+  fi
+  if [ ! -s "$db" ]; then
+    cp "$mihomo_config" "$manage_dir/profiles/current.yaml" || fail '无法保存现有配置。'
+    printf '%s\n' '{"active":"current","profiles":[{"id":"current","name":"现有配置","url":"","updated":""}]}' > "$db"
+  fi
+}
+
+cleanup() {
+  [ -z "${work:-}" ] || rm -rf "$work"
+  if [ "${owned_lock:-false}" = true ]; then
+    rm -f "$manage_dir/operation.lock/pid"
+    rmdir "$manage_dir/operation.lock" 2>/dev/null
+    running && "$scripts_dir/box.dns" start >/dev/null 2>&1
+    "$scripts_dir/box.policy" start >/dev/null 2>&1
+  fi
+}
+
+lock_operation() {
+  if ! mkdir "$manage_dir/operation.lock" 2>/dev/null; then
+    local owner
+    owner=$(cat "$manage_dir/operation.lock/pid" 2>/dev/null)
+    case "$owner" in ''|*[!0-9]*) fail '另一个操作正在进行，请稍后重试。' ;; esac
+    if kill -0 "$owner" 2>/dev/null; then
+      fail '另一个操作正在进行，请稍后重试。'
+    fi
+    rm -f "$manage_dir/operation.lock/pid"
+    rmdir "$manage_dir/operation.lock" 2>/dev/null && mkdir "$manage_dir/operation.lock" || fail '无法获取操作锁。'
+  fi
+  owned_lock=true
+  printf '%s\n' "$$" > "$manage_dir/operation.lock/pid"
+  "$scripts_dir/box.dns" stop >/dev/null 2>&1
+}
+
+download() {
+  local url="$1" output="$2" limit="${3:-4194304}" ca="$box_run/ca-bundle.pem" quoted curl_command
+  # Android's native curl uses the platform resolver, including network-specific
+  # resolution and router Fake-IP answers. Keep the bundled utility as fallback.
+  curl_command=/system/bin/curl
+  [ -x "$curl_command" ] || curl_command="$bin_dir/curl"
+  if [ ! -s "$ca" ]; then
+    cat /system/etc/security/cacerts/* /apex/com.android.conscrypt/cacerts/* > "$ca" 2>/dev/null
+  fi
+  quoted=$(MFR_URL="$url" "$yq" -n -o=json -I=0 'strenv(MFR_URL)')
+  printf 'url = %s\n' "$quoted" | "$curl_command" --config - --fail --silent --show-error --location \
+    --proto '=https,http' --proto-redir '=https,http' --cacert "$ca" \
+    --connect-timeout 10 --max-time "${MFR_DOWNLOAD_TIMEOUT:-120}" --max-filesize "$limit" \
+    --output "$output" 2>/dev/null
+}
+
+validate_profile() {
+  local candidate="$1" nodes providers
+  [ -s "$candidate" ] || fail '订阅内容为空。'
+  "$yq" eval '.' "$candidate" >/dev/null 2>&1 || fail '下载内容不是有效 YAML。'
+  nodes=$("$yq" '(.proxies // []) | length' "$candidate")
+  providers=$("$yq" '(."proxy-providers" // {}) | length' "$candidate")
+  [ "$nodes" -gt 0 ] || [ "$providers" -gt 0 ] || fail '配置中没有节点或节点订阅。'
+  MFR_PROFILE_ID="$id" "$scripts_dir/box.service" validate "$candidate" > "$work/validate.log" 2>&1 || fail 'Mihomo 配置检查失败，原配置已保留。'
+}
+
+apply_current() {
+  # Prepare first even when a matching Wi-Fi will pause the service. Invalid
+  # settings still fail validation without replacing the active preferences.
+  "$scripts_dir/box.service" prepare > "$work/apply.log" 2>&1 || return 1
+  if mfr_wifi_matches "$(mfr_current_ssid)"; then
+    MFR_POLICY_LOCK_HELD=1 "$scripts_dir/box.policy" reconcile >> "$work/apply.log" 2>&1
+    result=$?
+    [ "$result" = 0 ] || return "$result"
+    MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" sync
+    return $?
+  fi
+  if running; then
+    "$scripts_dir/box.service" restart >> "$work/apply.log" 2>&1 || return 1
+    running || return 1
+  fi
+  MFR_POLICY_LOCK_HELD=1 "$scripts_dir/box.policy" reconcile >> "$work/apply.log" 2>&1 || return 1
+  MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" sync >> "$work/apply.log" 2>&1
+}
+
+activate_file() {
+  local candidate="$1" was_running=false
+  running && was_running=true
+  cp -p "$mihomo_config" "$work/config.previous" || return 1
+  cp -p "$db" "$work/profiles.activate.previous" || return 1
+  MFR_ID="$id" "$yq" -i '.active = strenv(MFR_ID)' "$db" || return 1
+  cp "$candidate" "$mihomo_config" || { cp -p "$work/profiles.activate.previous" "$db"; return 1; }
+  if apply_current; then return 0; fi
+  cp -p "$work/config.previous" "$mihomo_config"
+  cp -p "$work/profiles.activate.previous" "$db"
+  "$scripts_dir/box.service" prepare > "$work/restore-prepare.log" 2>&1
+  if [ "$was_running" = true ]; then "$scripts_dir/box.service" restart > "$work/restore.log" 2>&1; fi
+  return 1
+}
+
+get_id() {
+  id=$("$yq" -r '.id // ""' "$request")
+  case "$id" in ''|*[!a-z0-9_-]*) fail '配置标识无效。' ;; esac
+  MFR_ID="$id" "$yq" -e '.profiles[] | select(.id == strenv(MFR_ID))' "$db" >/dev/null || fail '配置不存在。'
+}
+
+profile_fields() {
+  "$yq" -e '(.name | tag == "!!str") and (.name | length > 0 and length <= 80) and
+    (.url | tag == "!!str") and (.cron | tag == "!!str")' "$request" >/dev/null || fail '配置名称或订阅设置无效。'
+  name=$("$yq" -r '.name' "$request")
+  url=$("$yq" -r '.url' "$request")
+  expression=$("$yq" -r '.cron' "$request")
+  if [ -n "$url" ]; then
+    case "$url" in https://*|http://*) ;; *) fail '订阅链接需要以 http:// 或 https:// 开头。' ;; esac
+  fi
+  if [ -n "$expression" ]; then
+    [ -n "$url" ] || fail '只有订阅配置可以定时刷新。'
+    mfr_cron_valid "$expression" || fail 'Cron 格式无效，需要五个数字字段。'
+    busybox crond --help >/dev/null 2>&1 || fail '当前 BusyBox 不支持定时任务。'
+  fi
+}
+
+sync_cron() {
+  "$scripts_dir/box.cron" sync >/dev/null 2>&1 || fail '定时任务更新失败，请检查后重新保存。'
+}
+
+latest_release() {
+  download 'https://api.github.com/repos/MetaCubeX/mihomo/releases/latest' "$work/release.json" || fail '无法检查官方版本，请检查网络后重试。'
+  tag=$("$yq" -r '.tag_name' "$work/release.json")
+  case "$tag" in v[0-9]*.[0-9]*.[0-9]*) ;; *) fail '官方版本信息无效。' ;; esac
+  asset="mihomo-android-arm64-v8-${tag}.gz"
+  asset_url=$(MFR_ASSET="$asset" "$yq" -r '.assets[] | select(.name == strenv(MFR_ASSET)) | .browser_download_url' "$work/release.json")
+  case "$asset_url" in https://github.com/MetaCubeX/mihomo/releases/download/*) ;; *) fail '没有匹配的 Android ARM64 内核。' ;; esac
+}
+
+initialize
+work=$(mktemp -d "$manage_dir/.request.XXXXXX") || exit 1
+trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
+request="$work/request.json"
+if [ -n "${MFR_REQUEST_FILE:-}" ]; then
+  cp "$MFR_REQUEST_FILE" "$request" || fail '请求格式无效。'
+else
+  printf '%s' "${MFR_PAYLOAD:-e30=}" | busybox base64 -d > "$request" 2>/dev/null || fail '请求格式无效。'
+fi
+"$yq" -e 'tag == "!!map"' "$request" >/dev/null 2>&1 || fail '请求格式无效。'
+token=$("$yq" -r '.__request_token // ""' "$request")
+if [ -n "$token" ]; then
+  case "$token" in *[!a-z0-9]*) fail '请求标识无效。' ;; esac
+  [ -f "$manage_dir/uploads/$token.yaml" ] || fail '请求已过期。'
+  mv "$manage_dir/uploads/$token.yaml" "$request" || fail '无法读取请求。'
+  "$yq" -e 'tag == "!!map"' "$request" >/dev/null 2>&1 || fail '请求格式无效。'
+fi
+
+defaults_output() {
+  local path digest custom=false
+  path=$(mfr_defaults_path)
+  digest=$(busybox sha256sum "$path") || return 1
+  [ "$path" = "$box_dir/templates/default.yaml" ] || custom=true
+  MFR_DEFAULTS_PATH="$path" MFR_DEFAULTS_DIGEST="${digest%% *}" MFR_DEFAULTS_CUSTOM="$custom" "$yq" -n -o=json '
+    {"yaml":load_str(strenv(MFR_DEFAULTS_PATH)),"revision":strenv(MFR_DEFAULTS_DIGEST),"custom":(strenv(MFR_DEFAULTS_CUSTOM) == "true")}'
+}
+
+case "$1" in
+  defaults-get)
+    defaults_output || fail '无法读取兜底 YAML。'
+    ;;
+  defaults-save|defaults-restore)
+    lock_operation
+    current_defaults=$(mfr_defaults_path)
+    current_digest=$(busybox sha256sum "$current_defaults") || fail '无法读取当前兜底。'
+    MFR_REVISION="${current_digest%% *}" "$yq" -e '.revision == strenv(MFR_REVISION)' "$request" >/dev/null || fail '兜底已变化，请重新打开页面后再保存。'
+    candidate="$work/defaults.yaml"
+    if [ "$1" = defaults-save ]; then
+      "$yq" -e '(.yaml | tag == "!!str") and (.yaml | length > 0 and length <= 262144)' "$request" >/dev/null || fail '请填写兜底 YAML，大小不能超过 256 KiB。'
+      "$yq" -r '.yaml | @base64' "$request" | busybox base64 -d > "$candidate" || fail '无法读取兜底 YAML。'
+      [ "$(wc -c < "$candidate")" -le 262144 ] || fail '兜底 YAML 不能超过 256 KiB。'
+    else
+      cp "$box_dir/templates/default.yaml" "$candidate" || fail '无法读取内置兜底。'
+    fi
+    "$yq" eval-all -e '[.] | (length == 1 and (.[0] | tag == "!!map"))' "$candidate" > "$work/yaml-check.log" 2>&1 || fail 'YAML 格式无效，需要单份配置映射。'
+    # Check a minimal source as well: a complete current subscription can hide
+    # malformed fallback values by overriding them.
+    printf '%s\n' 'proxies: []' > "$work/minimal.yaml"
+    MFR_DEFAULTS_FILE="$candidate" "$scripts_dir/box.service" validate "$work/minimal.yaml" > "$work/defaults-check.log" 2>&1 || fail '兜底配置检查失败，原兜底已保留。'
+    MFR_DEFAULTS_FILE="$candidate" "$scripts_dir/box.service" validate "$mihomo_config" > "$work/current-check.log" 2>&1 || fail '与当前配置合成后检查失败，原兜底已保留。'
+    custom_defaults="$manage_dir/defaults.yaml"
+    had_custom=false; was_running=false
+    [ ! -f "$custom_defaults" ] || { cp -p "$custom_defaults" "$work/defaults.previous" || fail '无法备份原兜底。'; had_custom=true; }
+    [ ! -f "$box_dns_runtime" ] || cp -p "$box_dns_runtime" "$work/runtime.previous" || fail '无法备份运行配置。'
+    running && was_running=true
+    if [ "$1" = defaults-save ]; then
+      cp "$candidate" "$custom_defaults.next" && chmod 600 "$custom_defaults.next" && mv "$custom_defaults.next" "$custom_defaults" || fail '无法保存兜底 YAML。'
+    else
+      rm -f "$custom_defaults" || fail '无法恢复内置兜底。'
+    fi
+    if ! apply_current; then
+      if [ "$had_custom" = true ]; then
+        cp -p "$work/defaults.previous" "$custom_defaults.next" && mv "$custom_defaults.next" "$custom_defaults"
+      else
+        rm -f "$custom_defaults"
+      fi
+      if ! "$scripts_dir/box.service" prepare > "$work/restore-prepare.log" 2>&1; then
+        [ ! -f "$work/runtime.previous" ] || cp -p "$work/runtime.previous" "$box_dns_runtime"
+      fi
+      if [ "$was_running" = true ]; then "$scripts_dir/box.service" restart > "$work/restore.log" 2>&1; fi
+      fail '应用失败，已恢复原兜底文件。'
+    fi
+    defaults_output
+    ;;
+  logs)
+    kind=$("$yq" -r '.type // "module"' "$request")
+    case "$kind" in module|mihomo|agh) ;; *) fail '日志类型无效。' ;; esac
+    mfr_log_read "$kind" > "$work/log.txt" || fail '无法读取日志。'
+    MFR_LOG_TYPE="$kind" MFR_LOG_TEXT="$(cat "$work/log.txt")" MFR_LOG_TIME="$(date '+%H:%M:%S')" "$yq" -n -o=json '
+      {"type":strenv(MFR_LOG_TYPE),"text":strenv(MFR_LOG_TEXT),"updated":strenv(MFR_LOG_TIME)}'
+    ;;
+  status)
+    active=$("$yq" -r '.active' "$db")
+    core_version=$("$bin_path" -v 2>/dev/null | head -n 1)
+    live=false; running && live=true
+    snapshot=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network)
+    servers=${snapshot##*\|}
+    ssid=$(mfr_current_ssid)
+    paused=false
+    [ ! -f "$box_run_state/wifi-paused" ] || paused=true
+    wanted=$(cat "$manage_dir/service-intent" 2>/dev/null)
+    [ "$wanted" != stopped ] || paused=false
+    [ ! -f /data/adb/modules/box_for_root/disable ] || paused=false
+    effective_routing="$routing_mode"
+    if [ "$live" = true ] && box_dns_api_get /configs > "$work/live-config.json"; then
+      effective_routing=$("$yq" -r '.mode' "$work/live-config.json")
+    fi
+    effective_config="$box_dns_runtime"; [ -s "$effective_config" ] || effective_config="$mihomo_config"
+    fake_ip=$("$yq" -r '.dns."enhanced-mode" == "fake-ip"' "$effective_config")
+    printf '%s\n' "$servers" | busybox awk 'BEGIN {printf "["} {for(i=1;i<=NF;i++){if(n++)printf ",";printf "\"%s\"",$i}} END {print "]"}' > "$work/detected.json"
+    adg_status "$work" "$work/detected.json" > "$work/adguardhome.json"
+    summary_state=stopped
+    [ "$paused" != true ] || summary_state=paused
+    [ "$live" != true ] || summary_state=running
+    summary=$(mfr_status_line "$effective_config" "$summary_state" "$effective_routing" "$work/adguardhome.json")
+    mfr_write_description "$summary"
+    adg_controls_read "$work/adg-controls.json" || fail '无法读取 AGH 快捷设置。'
+    adg_controls_read "$work/adg-defaults.json" defaults || fail '无法读取 AGH 默认配置。'
+    mfr_apps_counts > "$work/app-counts.json"
+    mfr_profile_modes "$mihomo_config" "$work/mihomo-base.json" || fail '无法读取 Mihomo 配置。'
+    mfr_profile_dns "$mihomo_config" "$work/profile-dns.json" || fail '无法读取 Mihomo DNS。'
+    defaults_custom=false; [ ! -f "$manage_dir/defaults.yaml" ] || defaults_custom=true
+    MFR_ADG_DEFAULTS="$work/adg-defaults.json" MFR_DEFAULTS_CUSTOM="$defaults_custom" MFR_ADG_CONTROLS="$work/adg-controls.json" MFR_APP_COUNTS="$work/app-counts.json" MFR_MIHOMO_BASE="$work/mihomo-base.json" MFR_SUMMARY="$summary" MFR_PROFILE_DNS="$work/profile-dns.json" MFR_ADG_JSON="$work/adguardhome.json" \
+    MFR_VERSION="$core_version" MFR_RUNNING="$live" MFR_PREF="$preferences_file" MFR_DB="$db" \
+      MFR_SOURCE="$mihomo_config" MFR_DETECTED="$work/detected.json" MFR_SSID="$ssid" MFR_PAUSED="$paused" \
+      MFR_ROUTING_MODE="$effective_routing" MFR_FAKE_IP="$fake_ip" "$yq" -n -o=json '
+      {"running": (strenv(MFR_RUNNING) == "true"), "version": strenv(MFR_VERSION), "summary":strenv(MFR_SUMMARY),
+       "defaults_custom":(strenv(MFR_DEFAULTS_CUSTOM) == "true"),
+       "adg_controls":load(strenv(MFR_ADG_CONTROLS)), "adg_defaults":load(strenv(MFR_ADG_DEFAULTS)),
+       "app_counts":load(strenv(MFR_APP_COUNTS)), "mihomo_base":load(strenv(MFR_MIHOMO_BASE)),
+       "adguardhome":load(strenv(MFR_ADG_JSON)),
+       "wifi_paused": (strenv(MFR_PAUSED) == "true"), "current_ssid": strenv(MFR_SSID),
+       "routing_mode":strenv(MFR_ROUTING_MODE), "fake_ip":(strenv(MFR_FAKE_IP) == "true"),
+       "preferences": ({"tun_mode":"follow", "dns_mode":"follow", "dns_hijack_mode":"follow", "adguardhome_enabled":false, "wifi_pause_enabled":false, "wifi_pause_ssids":[]} * load(strenv(MFR_PREF))), "configs": load(strenv(MFR_DB)),
+       "dns":load(strenv(MFR_PROFILE_DNS)),
+       "dns_original": (load(strenv(MFR_SOURCE)).dns.nameserver // []),
+       "dns_detected": load(strenv(MFR_DETECTED))}'
+    ;;
+  apps)
+    # Android's Binder shell command cannot write to a root-private file FD.
+    # Give it a pipe; only our own shell writes the private result files.
+    cmd package list packages -s --user 0 2>&1 | cat > "$work/system-apps"
+    cmd package list packages -U --user 0 2>&1 | cat > "$work/installed-apps"
+    grep -q '^package:' "$work/installed-apps" || fail '无法读取应用列表，请重新打开管理页面。'
+    busybox awk '
+      BEGIN {print "["} NR==FNR {sub(/^package:/,"",$1);sys[$1]=1;next}
+      /^package:/ {sub(/^package:/,"",$1); sub(/^uid:/,"",$2); if(n++)printf ",";
+        printf "{\"packageName\":\"%s\",\"uid\":%d,\"system\":%s}",$1,$2,($1 in sys)?"true":"false"} END {print "]"}' "$work/system-apps" "$work/installed-apps"
+    ;;
+  connection)
+    "$scripts_dir/box.webui"
+    ;;
+  app-list-preview)
+    kind=$("$yq" -r '.kind // "china"' "$request")
+    case "$kind" in china|proxy) ;; *) fail '应用清单类型无效。' ;; esac
+    if [ "$kind" = proxy ]; then
+      cache="$manage_dir/proxy-apps-cache.json"
+      origin=builtin
+      list="$box_dir/lists/proxy-apps.json"
+      if MFR_DOWNLOAD_TIMEOUT=20 download 'https://raw.githubusercontent.com/2dust/v2rayNG/master/V2rayNG/app/src/main/assets/proxy_package_name' "$work/proxy.txt" 1048576 &&
+         mfr_apps_parse_proxy_list "$work/proxy.txt" "$work/proxy.json"; then
+        MFR_TIME="$(date '+%Y-%m-%d %H:%M')" "$yq" -i '.updated = strenv(MFR_TIME) | .source = "2dust/v2rayNG"' "$work/proxy.json"
+        mv "$work/proxy.json" "$cache" || fail '无法保存应用清单缓存。'
+        origin=online; list="$cache"
+      elif [ -s "$cache" ] && "$yq" -e '.packages | tag == "!!seq" and length > 0' "$cache" >/dev/null; then
+        origin=cache; list="$cache"
+      fi
+      MFR_LIST="$list" MFR_ORIGIN="$origin" "$yq" -n -o=json 'load(strenv(MFR_LIST)) + {"origin":strenv(MFR_ORIGIN)}'
+      exit 0
+    fi
+    cache="$manage_dir/china-apps-cache.json"
+    origin=builtin
+    valid_online=true
+    for category in APP GAME; do
+      if ! MFR_DOWNLOAD_TIMEOUT=20 download "https://raw.githubusercontent.com/mnixry/direct-android-ruleset/refs/heads/rules/@Merged/${category}.mutated.yaml" "$work/$category.yaml" 8388608 ||
+         ! mfr_apps_parse_list "$work/$category.yaml" "$work/$category.json"; then
+        valid_online=false
+        break
+      fi
+    done
+    if [ "$valid_online" = true ]; then
+      MFR_APP="$work/APP.json" MFR_GAME="$work/GAME.json" MFR_TIME="$(date '+%Y-%m-%d %H:%M')" "$yq" -n -o=json '
+        {"packages":((load(strenv(MFR_APP)).packages + load(strenv(MFR_GAME)).packages) | unique),
+         "updated":strenv(MFR_TIME), "source":"mnixry/direct-android-ruleset"}' > "$work/cache.json" || fail '应用清单解析失败。'
+      mv "$work/cache.json" "$cache" || fail '无法保存应用清单缓存。'
+      origin=online
+      list="$cache"
+    elif [ -s "$cache" ] && "$yq" -e '(.packages | tag == "!!seq") and (.packages | length > 0)' "$cache" >/dev/null 2>&1; then
+      origin=cache
+      list="$cache"
+    else
+      list="$box_dir/lists/china-apps.json"
+    fi
+    MFR_LIST="$list" MFR_ORIGIN="$origin" "$yq" -n -o=json 'load(strenv(MFR_LIST)) + {"origin":strenv(MFR_ORIGIN)}'
+    ;;
+  upload-start)
+    token="u$(date +%s)$$"
+    : > "$manage_dir/uploads/$token.yaml"
+    printf '{"token":"%s"}\n' "$token"
+    ;;
+  upload-chunk)
+    token=$("$yq" -r '.token' "$request")
+    case "$token" in ''|*[!a-z0-9]*) fail '上传标识无效。' ;; esac
+    [ -f "$manage_dir/uploads/$token.yaml" ] || fail '上传已过期。'
+    [ "$(wc -c < "$manage_dir/uploads/$token.yaml")" -lt 4194304 ] || fail '配置文件超过 4 MB。'
+    "$yq" -r '.chunk' "$request" | busybox base64 -d >> "$manage_dir/uploads/$token.yaml" || fail '上传失败。'
+    ok
+    ;;
+  settings-save)
+    lock_operation
+    adg_reset=false
+    if [ "$("$yq" 'has("adg_reset_defaults")' "$request")" = true ]; then
+      "$yq" -e '.adg_reset_defaults | tag == "!!bool"' "$request" >/dev/null 2>&1 || fail 'AGH 恢复选项无效。'
+      adg_reset=$("$yq" -r '.adg_reset_defaults' "$request")
+    fi
+    # Older clients omit the new switch; preserve their existing preference.
+    if [ "$("$yq" 'has("adguardhome_enabled")' "$request")" != true ]; then
+      MFR_ADG="$("$yq" -r '.adguardhome_enabled // false' "$preferences_file")" "$yq" -i '.adguardhome_enabled = (strenv(MFR_ADG) == "true")' "$request"
+    fi
+    for field in tun_mode dns_mode; do
+      if [ "$(MFR_FIELD="$field" "$yq" 'has(strenv(MFR_FIELD))' "$request")" != true ]; then
+        MFR_FIELD="$field" MFR_PREVIOUS="$preferences_file" "$yq" -i '.[strenv(MFR_FIELD)] = (load(strenv(MFR_PREVIOUS))[strenv(MFR_FIELD)] // "follow")' "$request"
+      fi
+    done
+    "$yq" -e '(.tun_mode == "follow" or .tun_mode == "on" or .tun_mode == "off") and
+      (.dns_mode == "follow" or .dns_mode == "fake-ip" or .dns_mode == "redir-host") and
+      (.adguardhome_enabled | tag == "!!bool") and (.routing_mode == "rule" or .routing_mode == "global" or .routing_mode == "direct") and
+      (.ipv6_mode == "follow" or .ipv6_mode == "on" or .ipv6_mode == "off") and
+      (.dns_hijack_mode == "follow" or .dns_hijack_mode == "on" or .dns_hijack_mode == "off") and
+      (.wifi_pause_enabled | tag == "!!bool") and (.wifi_pause_ssids | tag == "!!seq") and
+      (.app_mode == "all" or .app_mode == "include" or .app_mode == "exclude") and
+      (.append_network_dns | tag == "!!bool") and (.include_apps | tag == "!!seq") and (.exclude_apps | tag == "!!seq")' "$request" >/dev/null || fail '设置格式无效。'
+    "$yq" -e '[.include_apps[], .exclude_apps[]] | length <= 20000' "$request" >/dev/null || fail '应用数量超过限制。'
+    "$yq" -e '[(.include_apps + .exclude_apps)[] | select(tag != "!!str" or test("^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+$") == false)] | length == 0' "$request" >/dev/null || fail '应用包名无效。'
+    "$yq" -e '[.wifi_pause_ssids[] | select(tag != "!!str" or length == 0 or length > 32 or test("[\\r\\n]"))] | length == 0' "$request" >/dev/null || fail 'Wi-Fi 名称无效，请每行填写一个名称（最多 32 个字符）。'
+    [ "$("$yq" '.wifi_pause_ssids | length' "$request")" -le 64 ] || fail 'Wi-Fi 名称不能超过 64 个。'
+    if [ "$("$yq" '.wifi_pause_enabled' "$request")" = true ]; then
+      [ "$("$yq" '.wifi_pause_ssids | length' "$request")" -gt 0 ] || fail '请填写至少一个 Wi-Fi 名称。'
+    fi
+    if [ "$("$yq" -r '.app_mode' "$request")" = include ]; then
+      [ "$("$yq" '.include_apps | length' "$request")" -gt 0 ] || fail '请至少选择一个应用。'
+    fi
+    if [ "$("$yq" 'has("dns_override")' "$request")" = true ]; then
+      [ "$("$yq" -r '.dns_profile_id // ""' "$request")" = "$("$yq" -r '.active' "$db")" ] || fail '当前配置已切换，请刷新后保存。'
+      "$yq" -e '(.dns_override | tag == "!!map") and
+        ([.dns_override | keys | .[] | select(. != "nameserver" and . != "fallback" and . != "default-nameserver")] | length == 0)' "$request" >/dev/null || fail 'DNS 设置格式无效。'
+      for field in nameserver fallback default-nameserver; do
+        if MFR_FIELD="$field" "$yq" -e '.dns_override | has(strenv(MFR_FIELD))' "$request" >/dev/null; then
+          MFR_FIELD="$field" "$yq" -e '.dns_override[strenv(MFR_FIELD)] | tag == "!!seq" and length <= 32' "$request" >/dev/null || fail 'DNS 每项最多填写 32 个地址。'
+          MFR_FIELD="$field" "$yq" -e '[.dns_override[strenv(MFR_FIELD)][] | select(tag != "!!str" or length == 0 or length > 512 or test("[\\r\\n]"))] | length == 0' "$request" >/dev/null || fail 'DNS 地址无效，请每行填写一个地址。'
+          [ "$field" = fallback ] || [ "$(MFR_FIELD="$field" "$yq" '.dns_override[strenv(MFR_FIELD)] | length' "$request")" -gt 0 ] || fail 'nameserver 和 default-nameserver 不能为空。'
+        fi
+      done
+    fi
+    if [ "$("$yq" 'has("adg_controls")' "$request")" = true ]; then
+      "$yq" -o=json '.adg_controls' "$request" > "$work/adg-controls.json"
+      adg_controls_valid "$work/adg-controls.json" || fail 'AGH 设置无效：域名每行一个，黑名单最多 3 个 HTTP(S) 链接。'
+      "$yq" -i '.adg_controls.ipv6_allow |= map(select(test("^\\s*#")) // (sub("^\\s+"; "") | sub("\\s+$"; "") | downcase))' "$request"
+    elif [ "$("$yq" 'has("adg_controls")' "$preferences_file")" = true ]; then
+      MFR_PREVIOUS="$preferences_file" "$yq" -i '.adg_controls = load(strenv(MFR_PREVIOUS)).adg_controls' "$request"
+    fi
+    if [ "$adg_reset" = true ]; then
+      cp "$box_dir/templates/AdGuardHome.yaml" "$work/adg-reset.yaml" || fail '无法读取 AGH 默认配置。'
+      "$bin_dir/AdGuardHome" --check-config -c "$work/adg-reset.yaml" -w "$adg_dir" > "$work/adg-reset-check.log" 2>&1 || fail 'AGH 默认配置检查失败，原配置已保留。'
+      mkdir -p "$manage_dir/backups" || fail '无法创建 AGH 备份目录。'
+      adg_backup=$(mktemp -d "$manage_dir/backups/adguardhome-reset.XXXXXXXX") || fail '无法备份 AGH 配置。'
+      [ ! -f "$adg_config" ] || cp -p "$adg_config" "$adg_backup/AdGuardHome.yaml" || fail '无法备份 AGH 配置。'
+      [ ! -f "$manage_dir/adg-owned-urls.json" ] || cp -p "$manage_dir/adg-owned-urls.json" "$adg_backup/adg-owned-urls.json" || fail '无法备份 AGH 订阅设置。'
+    fi
+    cp -p "$db" "$work/profiles.previous" || fail '无法备份 DNS 设置。'
+    if [ "$("$yq" 'has("dns_override")' "$request")" = true ]; then
+      MFR_REQUEST="$request" "$yq" -i '.active as $active |
+        (.profiles[] | select(.id == $active)).dns_override = load(strenv(MFR_REQUEST)).dns_override' "$db" || fail '无法保存 DNS 设置。'
+    fi
+    cp -p "$preferences_file" "$work/preferences.previous"
+    "$yq" -o=json '{"tun_mode":.tun_mode,"dns_mode":.dns_mode,"routing_mode":.routing_mode,"ipv6_mode":.ipv6_mode,"append_network_dns":.append_network_dns,
+      "adguardhome_enabled":.adguardhome_enabled,"dns_hijack_mode":.dns_hijack_mode,"wifi_pause_enabled":.wifi_pause_enabled,"wifi_pause_ssids":(.wifi_pause_ssids | unique),
+      "app_mode":.app_mode,"include_apps":(.include_apps | unique),"exclude_apps":(.exclude_apps | unique)}' "$request" > "$work/preferences.next"
+    if [ "$("$yq" 'has("adg_controls")' "$request")" = true ]; then
+      MFR_REQUEST="$request" "$yq" -i -o=json '.adg_controls = (load(strenv(MFR_REQUEST)).adg_controls | pick(["ipv6_filter","ipv6_allow","adblock","filter_urls"]))' "$work/preferences.next" || fail '无法保存 AGH 设置。'
+    fi
+    mv "$work/preferences.next" "$preferences_file" || fail '无法保存设置。'
+    was_running=false; running && was_running=true
+    apply_needed=true
+    if MFR_OLD="$work/preferences.previous" MFR_NEW="$preferences_file" "$yq" -n -e '
+      (load(strenv(MFR_OLD)) | del(.adg_controls) | .tun_mode = (.tun_mode // "follow") | .dns_mode = (.dns_mode // "follow") | sort_keys(..) | to_json) ==
+      (load(strenv(MFR_NEW)) | del(.adg_controls) | sort_keys(..) | to_json)' >/dev/null &&
+       MFR_OLD="$work/profiles.previous" MFR_NEW="$db" "$yq" -n -e '
+      (load(strenv(MFR_OLD)) | .active as $id | .profiles[] | select(.id == $id) | .dns_override // {} | sort_keys(..) | to_json) ==
+      (load(strenv(MFR_NEW)) | .active as $id | .profiles[] | select(.id == $id) | .dns_override // {} | sort_keys(..) | to_json)' >/dev/null; then apply_needed=false; fi
+    apply_failed=false
+    if [ "$adg_reset" = true ]; then
+      cp -p "$work/preferences.previous" "$adg_backup/preferences.json"
+      MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" replace-config "$work/adg-reset.yaml" >> "$work/apply.log" 2>&1 || apply_failed=true
+    fi
+    if [ "$apply_failed" = false ] && [ "$apply_needed" = true ]; then
+      MFR_SKIP_ADG_CONTROLS=1 apply_current || apply_failed=true
+    fi
+    if [ "$apply_failed" = false ]; then
+      MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" sync >> "$work/apply.log" 2>&1 || apply_failed=true
+    fi
+    if [ "$apply_failed" = true ]; then
+      cp -p "$work/preferences.previous" "$preferences_file"
+      cp -p "$work/profiles.previous" "$db"
+      if [ "$adg_reset" = true ]; then
+        if [ -f "$adg_backup/AdGuardHome.yaml" ]; then
+          MFR_ADG_OPERATION=1 MFR_ADG_RESTORE=1 "$scripts_dir/box.adg" replace-config "$adg_backup/AdGuardHome.yaml" >> "$work/restore.log" 2>&1
+        else
+          "$scripts_dir/box.adg" stop >> "$work/restore.log" 2>&1
+          rm -f "$adg_config"
+        fi
+        [ ! -f "$adg_backup/adg-owned-urls.json" ] || cp -p "$adg_backup/adg-owned-urls.json" "$manage_dir/adg-owned-urls.json"
+      fi
+      if [ "$apply_needed" = true ]; then
+        "$scripts_dir/box.service" prepare > "$work/restore-prepare.log" 2>&1
+        [ "$was_running" != true ] || "$scripts_dir/box.service" restart > "$work/restore.log" 2>&1
+      fi
+      MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" sync >/dev/null 2>&1
+      fail '设置未能生效，已恢复原设置。'
+    fi
+    ok
+    ;;
+  profile-add)
+    lock_operation
+    id="p$(date +%s)$$"
+    "$yq" -i '.url = (.url // "") | .cron = (.cron // "")' "$request"
+    profile_fields
+    candidate="$work/candidate.yaml"
+    if [ -n "$url" ]; then
+      case "$url" in https://*|http://*) ;; *) fail '订阅链接需要以 http:// 或 https:// 开头。' ;; esac
+      download "$url" "$candidate" || fail '订阅下载失败，原配置已保留。'
+    else
+      token=$("$yq" -r '.token // ""' "$request")
+      case "$token" in ''|*[!a-z0-9]*) fail '请选择本地 YAML 文件。' ;; esac
+      [ -f "$manage_dir/uploads/$token.yaml" ] || fail '上传文件不存在。'
+      mv "$manage_dir/uploads/$token.yaml" "$candidate"
+    fi
+    validate_profile "$candidate"
+    cp "$candidate" "$manage_dir/profiles/$id.yaml" || fail '无法保存配置。'
+    MFR_ID="$id" MFR_NAME="$name" MFR_URL="$url" MFR_CRON="$expression" MFR_TIME="$(date '+%Y-%m-%d %H:%M')" "$yq" -i '
+      .profiles += [{"id":strenv(MFR_ID),"name":strenv(MFR_NAME),"url":strenv(MFR_URL),"cron":strenv(MFR_CRON),"updated":strenv(MFR_TIME)}]' "$db"
+    sync_cron
+    MFR_ID="$id" "$yq" -n -o=json '{"ok":true,"id":strenv(MFR_ID)}'
+    ;;
+  profile-edit)
+    lock_operation
+    get_id
+    profile_fields
+    previous_url=$(MFR_ID="$id" "$yq" -r '.profiles[] | select(.id == strenv(MFR_ID)) | .url // ""' "$db")
+    if [ -n "$url" ] && [ "$url" != "$previous_url" ]; then
+      candidate="$work/candidate.yaml"
+      download "$url" "$candidate" || fail '订阅下载失败，原配置已保留。'
+      validate_profile "$candidate"
+      if [ "$id" = "$("$yq" -r '.active' "$db")" ]; then
+        activate_file "$candidate" || fail '配置加载失败，已恢复原配置。'
+      fi
+      cp "$candidate" "$manage_dir/profiles/$id.yaml" || fail '无法保存配置。'
+      MFR_ID="$id" MFR_TIME="$(date '+%Y-%m-%d %H:%M')" "$yq" -i '(.profiles[] | select(.id == strenv(MFR_ID))).updated = strenv(MFR_TIME)' "$db"
+    fi
+    MFR_ID="$id" MFR_NAME="$name" MFR_URL="$url" MFR_CRON="$expression" "$yq" -i '
+      (.profiles[] | select(.id == strenv(MFR_ID))) |= (.name = strenv(MFR_NAME) | .url = strenv(MFR_URL) | .cron = strenv(MFR_CRON))' "$db"
+    sync_cron
+    ok
+    ;;
+  profile-activate|profile-update|profile-delete)
+    lock_operation
+    get_id
+    active=$("$yq" -r '.active' "$db")
+    if [ "$1" = profile-delete ]; then
+      [ "$id" != "$active" ] || fail '当前正在使用的配置不能删除。'
+      MFR_ID="$id" "$yq" -i 'del(.profiles[] | select(.id == strenv(MFR_ID)))' "$db"
+      rm -f "$manage_dir/profiles/$id.yaml"
+      sync_cron
+      ok; exit 0
+    fi
+    candidate="$manage_dir/profiles/$id.yaml"
+    if [ "$1" = profile-update ]; then
+      url=$(MFR_ID="$id" "$yq" -r '.profiles[] | select(.id == strenv(MFR_ID)) | .url' "$db")
+      [ -n "$url" ] || fail '本地配置没有订阅链接，请重新导入文件。'
+      candidate="$work/candidate.yaml"
+      download "$url" "$candidate" || fail '订阅下载失败，原配置已保留。'
+    fi
+    validate_profile "$candidate"
+    if [ "$1" = profile-activate ] || [ "$id" = "$active" ]; then
+      activate_file "$candidate" || fail '配置加载失败，已恢复原配置。'
+    fi
+    if [ "$1" = profile-update ]; then
+      cp "$candidate" "$manage_dir/profiles/$id.yaml" || fail '无法保存配置。'
+      MFR_ID="$id" MFR_TIME="$(date '+%Y-%m-%d %H:%M')" "$yq" -i '(.profiles[] | select(.id == strenv(MFR_ID))).updated = strenv(MFR_TIME)' "$db"
+    fi
+    ok
+    ;;
+  panel-update)
+    lock_operation
+    download 'https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip' "$work/dashboard.zip" 20971520 || fail '面板下载失败。'
+    mkdir "$work/dashboard"
+    busybox unzip -q "$work/dashboard.zip" -d "$work/dashboard" || fail '面板解压失败。'
+    [ -s "$work/dashboard/index.html" ] || fail '面板文件无效，原面板已保留。'
+    mv "$box_dir/mihomo/dashboard" "$work/dashboard.previous" || fail '无法备份原面板。'
+    mv "$work/dashboard" "$box_dir/mihomo/dashboard" || {
+      mv "$work/dashboard.previous" "$box_dir/mihomo/dashboard"
+      fail '面板更新失败，已恢复。'
+    }
+    ok
+    ;;
+  core-check)
+    latest_release
+    MFR_TAG="$tag" "$yq" -n -o=json '{"latest":strenv(MFR_TAG)}'
+    ;;
+  core-update|core-rollback)
+    lock_operation
+    if [ "$1" = core-update ]; then
+      latest_release
+      download "$asset_url" "$work/mihomo.gz" 104857600 || fail '内核下载失败，现有内核已保留。'
+      digest=$(MFR_ASSET="$asset" "$yq" -r '.assets[] | select(.name == strenv(MFR_ASSET)) | .digest // ""' "$work/release.json")
+      if [ -n "$digest" ]; then
+        [ "sha256:$(sha256sum "$work/mihomo.gz" | cut -d' ' -f1)" = "$digest" ] || fail '内核校验失败，现有内核已保留。'
+      fi
+      busybox gzip -dc "$work/mihomo.gz" > "$work/mihomo" || fail '内核解压失败。'
+    else
+      [ -s "$bin_dir/mihomo.previous" ] || fail '没有可恢复的上一版本。'
+      cp "$bin_dir/mihomo.previous" "$work/mihomo"
+    fi
+    chmod 755 "$work/mihomo"
+    "$work/mihomo" -v > "$work/version" 2>&1 || fail '内核不可运行，现有内核已保留。'
+    test_config="$box_dns_runtime"; [ -s "$test_config" ] || test_config="$mihomo_config"
+    "$work/mihomo" -t -d "$box_dir/mihomo" -f "$test_config" > "$work/check.log" 2>&1 || fail '新内核未通过当前配置检查，现有内核已保留。'
+    was_running=false; running && was_running=true
+    if [ "$was_running" = true ]; then
+      "$scripts_dir/box.iptables" disable > "$work/stop.log" 2>&1
+      "$scripts_dir/box.service" stop >> "$work/stop.log" 2>&1
+    fi
+    cp "$bin_path" "$work/mihomo.old"
+    mv "$work/mihomo" "$bin_path"
+    chown root:net_admin "$bin_path"; chmod 755 "$bin_path"
+    if [ "$was_running" = true ] && ! ("$scripts_dir/box.service" restart > "$work/start.log" 2>&1 && running); then
+      mv "$work/mihomo.old" "$bin_path"
+      "$scripts_dir/box.service" restart > "$work/restore.log" 2>&1
+      fail '新内核启动失败，已恢复原版本。'
+    fi
+    mv "$work/mihomo.old" "$bin_dir/mihomo.previous"
+    ok
+    ;;
+  start|stop)
+    lock_operation
+    if [ "$1" = start ]; then
+      "$scripts_dir/box.service" prepare > "$work/start.log" 2>&1 || fail '配置检查失败。'
+      MFR_POLICY_LOCK_HELD=1 "$scripts_dir/box.policy" request-start >> "$work/start.log" 2>&1 || fail '启动失败，请检查配置。'
+    else
+      MFR_POLICY_LOCK_HELD=1 "$scripts_dir/box.policy" request-stop > "$work/stop.log" 2>&1 || fail '停止失败，请重试。'
+    fi
+    ok
+    ;;
+  *) fail '不支持的操作。' ;;
+esac

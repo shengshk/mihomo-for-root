@@ -1,0 +1,22 @@
+#!/system/bin/sh
+# Seed public Geo data only when missing. Keep user files and accepted aliases.
+mfr_seed_geodata() {
+  local source="$1" destination="$2" file existing
+  mkdir -p "$destination" || return 1
+  for file in GeoSite.dat GeoIP.dat Country.mmdb ASN.mmdb; do
+    if [ "$file" = Country.mmdb ]; then
+      existing=$(busybox find "$destination" -maxdepth 1 \( -iname "$file" -o -iname geoip.db -o -iname geoip.metadb \) -print |
+        while IFS= read -r candidate; do [ ! -s "$candidate" ] || { printf '%s\n' "$candidate"; break; }; done)
+    else
+      existing=$(busybox find "$destination" -maxdepth 1 -iname "$file" -print |
+        while IFS= read -r candidate; do [ ! -s "$candidate" ] || { printf '%s\n' "$candidate"; break; }; done)
+    fi
+    [ -z "$existing" ] || continue
+    [ -s "$source/$file" ] || return 1
+    if ! cp "$source/$file" "$destination/$file.next" || ! chmod 600 "$destination/$file.next" ||
+       ! mv "$destination/$file.next" "$destination/$file"; then
+      rm -f "$destination/$file.next"
+      return 1
+    fi
+  done
+}

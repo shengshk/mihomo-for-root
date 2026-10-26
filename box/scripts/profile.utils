@@ -1,0 +1,109 @@
+#!/system/bin/sh
+
+# DNS overrides belong to a profile, never to the downloaded YAML or network.
+mfr_profile_dns() {
+  local input="$1" output="$2" yq="$bin_dir/yq" profile_id="${MFR_PROFILE_ID:-}" override='{}'
+  local database="$manage_dir/profiles.json" normalized="${2}.source.json" template="${2}.defaults.json"
+  "$yq" -o=json '.dns // {}' "$input" > "$normalized" || return 1
+  if [ -s "$database" ]; then
+    [ -n "$profile_id" ] || profile_id=$("$yq" -r '.active' "$database")
+    override=$(MFR_ID="$profile_id" "$yq" -o=json -I=0 '.profiles[] | select(.id == strenv(MFR_ID)) | .dns_override // {}' "$database") || { rm -f "$normalized"; return 1; }
+    [ -n "$override" ] || override='{}'
+  fi
+  "$yq" -o=json '.dns // {}' "$(mfr_defaults_path)" > "$template" || { rm -f "$normalized" "$template"; return 1; }
+  MFR_DNS_SOURCE="$normalized" MFR_DNS_TEMPLATE="$template" MFR_DNS_OVERRIDE="$override" "$yq" -n -o=json '
+    load(strenv(MFR_DNS_SOURCE)) as $source |
+    load(strenv(MFR_DNS_TEMPLATE)) as $template |
+    {"base": {"nameserver": ($source.nameserver | select(length > 0) // $template.nameserver),
+      "fallback": ($source.fallback // $template.fallback // []),
+      "default-nameserver": ($source."default-nameserver" | select(length > 0) // $template."default-nameserver")},
+     "override": (strenv(MFR_DNS_OVERRIDE) | from_json)} |
+    .effective = (.base * .override)
+  ' > "$output"
+  local result=$?
+  rm -f "$normalized" "$template"
+  return "$result"
+}
+
+mfr_expand_config() {
+  local input="$1" output="$2" yq="$bin_dir/yq" normalized="${2}.input.json" template="${2}.defaults.json"
+  # JSON serialization expands aliases AND YAML merge keys before combining maps.
+  # Merging aliased YAML directly can move references ahead of their definitions.
+  if ! "$yq" -o=json '.' "$input" > "$normalized"; then
+    rm -f "$normalized"
+    return 1
+  fi
+  if ! "$yq" -o=json '.' "$(mfr_defaults_path)" > "$template"; then
+    rm -f "$normalized" "$template"
+    return 1
+  fi
+  if ! MFR_TEMPLATE="$template" MFR_INPUT="$normalized" "$yq" eval --null-input --prettyPrint '
+    load(strenv(MFR_TEMPLATE)) * load(strenv(MFR_INPUT))
+  ' > "$output"; then
+    rm -f "$normalized" "$template"
+    return 1
+  fi
+  rm -f "$normalized" "$template"
+  local dns_file="${output}.dns.json"
+  if ! mfr_profile_dns "$input" "$dns_file" ||
+     ! MFR_DNS_VALUES="$dns_file" "$yq" -i '.dns = (.dns * load(strenv(MFR_DNS_VALUES)).effective)' "$output"; then
+    rm -f "$dns_file"
+    return 1
+  fi
+  rm -f "$dns_file"
+  if [ "$("$yq" 'has("proxy-groups")' "$input")" != true ]; then
+    "$yq" -i '."proxy-groups"[0].proxies = (((."proxy-groups"[0].proxies // ["DIRECT"]) + [.proxies[].name]) | unique) |
+      ."proxy-groups"[0].use = (((."proxy-groups"[0].use // []) + ((."proxy-providers" // {}) | keys)) | unique)' "$output" || return 1
+  fi
+  if [ "$("$yq" 'has("rules")' "$input")" != true ]; then
+    # Retarget only the generated catch-all. Preserve advanced fallback rules,
+    # including an explicit empty list, instead of replacing them wholesale.
+    if "$yq" -e '(has("rules") | not) or (.rules == ["MATCH," + ."proxy-groups"[0].name])' "$(mfr_defaults_path)" >/dev/null 2>&1; then
+      "$yq" -i '.rules = ["MATCH," + ."proxy-groups"[0].name]' "$output" || return 1
+    fi
+  fi
+  "$yq" -i '."external-ui" = "./dashboard" |
+    ."external-ui-url" = "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"' "$output" || return 1
+  MFR_ROUTING_MODE="${routing_mode:-rule}" "$yq" -i '.mode = strenv(MFR_ROUTING_MODE)' "$output" || return 1
+  case "${tun_mode:-follow}" in
+    on) "$yq" -i '.tun.enable = true' "$output" || return 1 ;;
+    off) "$yq" -i '.tun.enable = false' "$output" || return 1 ;;
+  esac
+  case "${dns_mode:-follow}" in
+    fake-ip|redir-host) MFR_DNS_MODE="$dns_mode" "$yq" -i '.dns."enhanced-mode" = strenv(MFR_DNS_MODE)' "$output" || return 1 ;;
+  esac
+  if [ "$("$yq" -r '.dns."enhanced-mode"' "$output")" = fake-ip ]; then
+    # Template fills missing ranges; preserve explicit empty ranges from YAML.
+    # Respect explicit filter modes and CN rules; never invert a whitelist.
+    case "$("$yq" -r '.dns."fake-ip-filter-mode" // "blacklist"' "$output")" in
+      blacklist)
+        if ! "$yq" -e '[.dns."fake-ip-filter"[] | select(. == "geosite:cn")] | length > 0' "$output" >/dev/null; then
+          "$yq" -i '.dns."fake-ip-filter" = ((.dns."fake-ip-filter" // []) + ["geosite:cn"])' "$output" || return 1
+        fi ;;
+      rule)
+        if ! "$yq" -e '[.dns."fake-ip-filter"[] | select(test("(?i)^\\s*GEOSITE\\s*,\\s*cn\\s*,"))] | length > 0' "$output" >/dev/null; then
+          "$yq" -i '.dns."fake-ip-filter" = (["GEOSITE,cn,real-ip"] + (.dns."fake-ip-filter" // []))' "$output" || return 1
+        fi ;;
+    esac
+  fi
+  case "${ipv6_mode:-follow}" in
+    on) "$yq" -i '.ipv6 = true | .dns.ipv6 = true' "$output" ;;
+    off) "$yq" -i '.ipv6 = false | .dns.ipv6 = false' "$output" ;;
+  esac
+}
+
+# Follow-YAML preview and original field presence, before template completion.
+mfr_profile_modes() {
+  local normalized="${2}.source.json" template="${2}.defaults.json"
+  "$bin_dir/yq" -o=json '.' "$1" > "$normalized" || return 1
+  "$bin_dir/yq" -o=json '.' "$(mfr_defaults_path)" > "$template" || { rm -f "$normalized" "$template"; return 1; }
+  MFR_SOURCE="$normalized" MFR_TEMPLATE="$template" "$bin_dir/yq" -n -o=json '
+    load(strenv(MFR_SOURCE)) as $source |
+    (load(strenv(MFR_TEMPLATE)) * $source) |
+    {"tun":(.tun.enable == true),"dns_mode":(.dns."enhanced-mode" // "redir-host"),"ipv6":(.ipv6 == true),
+     "configured":{"tun":($source.tun // {} | has("enable")),
+       "dns_mode":($source.dns // {} | has("enhanced-mode")),"ipv6":($source | has("ipv6"))}}' > "$2"
+  local result=$?
+  rm -f "$normalized" "$template"
+  return "$result"
+}

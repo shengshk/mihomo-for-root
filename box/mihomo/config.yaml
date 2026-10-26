@@ -1,0 +1,43 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: true
+external-controller: 127.0.0.1:9090
+external-ui: ./dashboard
+external-ui-url: https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip
+secret: ""
+dns:
+  enable: true
+  listen: 127.0.0.1:15353
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+tun:
+  enable: true
+  device: Meta
+  stack: gvisor
+  auto-route: true
+  auto-redirect: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+  include-uid: []
+  exclude-uid: []
+proxies: []
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies: [DIRECT]
+rules:
+  - MATCH,节点选择

@@ -1,0 +1,141 @@
+#!/system/bin/sh
+# Optional module-owned shortcuts. No private domains belong in public defaults.
+adg_controls_read() {
+  local output="$1" source="$adg_config" pref='{}' rule allow='' v6=false
+  [ -s "$source" ] || source="$box_dir/templates/AdGuardHome.yaml"
+  [ "${2:-}" != defaults ] || source="$box_dir/templates/AdGuardHome.yaml"
+  "$bin_dir/yq" -e 'tag == "!!map"' "$source" >/dev/null 2>&1 || source="$box_dir/templates/AdGuardHome.yaml"
+  rule=$("$bin_dir/yq" -r '.user_rules[]' "$source" 2>/dev/null | busybox awk '/^\$dnstype=AAAA(,denyallow=[A-Za-z0-9.|-]+)?,dnsrewrite=NOERROR;;$/ {print;exit}')
+  [ -z "$rule" ] || v6=true
+  [ "$("$bin_dir/yq" -r '.dns.aaaa_disabled // false' "$source")" != true ] || v6=true
+  case "$rule" in *denyallow=*) allow=${rule#*denyallow=}; allow=${allow%%,*} ;; esac
+  [ "${2:-}" = defaults ] || [ ! -s "${preferences_file:-$manage_dir/preferences.json}" ] || pref=$("$bin_dir/yq" -o=json -I=0 '.adg_controls // {}' "${preferences_file:-$manage_dir/preferences.json}")
+  MFR_ADG_SOURCE="$source" MFR_ADG_PREF="$pref" MFR_ADG_V6="$v6" MFR_ADG_ALLOW="$allow" "$bin_dir/yq" -n -o=json '
+    load(strenv(MFR_ADG_SOURCE)) as $config |
+    {"ipv6_filter":(strenv(MFR_ADG_V6) == "true"),
+     "ipv6_allow":(strenv(MFR_ADG_ALLOW) | split("|") | map(select(length > 0))),
+     "adblock":([($config.filters | .[0:3])[] | select(.enabled == true)] | length > 0),
+     "filter_urls":([($config.filters | .[0:3])[].url])} * (strenv(MFR_ADG_PREF) | from_json)' > "$output"
+}
+
+# Comments stay in preferences. Only active lines reach rules and filter APIs.
+adg_controls_effective() {
+  "$bin_dir/yq" -o=json '
+    .ipv6_allow |= (map(sub("^\\s+"; "") | sub("\\s+$"; "")) | map(select(length > 0 and test("^#") == false)) | map(downcase) | unique) |
+    .filter_urls |= (map(sub("^\\s+"; "") | sub("\\s+$"; "")) | map(select(length > 0 and test("^#") == false)) | unique)' "$1"
+}
+
+adg_controls_valid() {
+  # Bound raw editor lines too, without counting comments as active entries.
+  "$bin_dir/yq" -e '(.ipv6_filter | tag == "!!bool") and (.adblock | tag == "!!bool") and
+    (.ipv6_allow | tag == "!!seq") and (.ipv6_allow | length <= 256) and
+    (.filter_urls | tag == "!!seq") and (.filter_urls | length <= 256) and
+    ([(.ipv6_allow + .filter_urls)[] | select(tag != "!!str" or length > 4096 or test("[\\r\\n]"))] | length == 0)' "$1" >/dev/null 2>&1 || return 1
+  adg_controls_effective "$1" | "$bin_dir/yq" -e '
+    (.ipv6_allow | length <= 64) and (.filter_urls | length <= 3) and
+    ([.ipv6_allow[] | select(length > 253 or
+      test("^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$") == false)] | length == 0) and
+    ([.filter_urls[] | select(length > 2048 or test("^https?://[^\\s]+$") == false)] | length == 0)' >/dev/null 2>&1
+}
+
+adg_controls_set_filter() {
+  local url="$1" enabled="$2" snapshot="$3" payload="$4"
+  MFR_URL="$url" MFR_ENABLED="$enabled" "$bin_dir/yq" -o=json '
+    .filters[] | select(.url == strenv(MFR_URL)) |
+    {"url":.url,"whitelist":false,"data":{"url":.url,"name":.name,"enabled":(strenv(MFR_ENABLED) == "true")}}' "$snapshot" > "$payload" || return 1
+  [ -s "$payload" ] || return 1
+  adg_api POST filtering/set_url --data-binary "@$payload" >/dev/null
+}
+
+adg_controls_change() {
+  local directory="$1" wanted="$1/wanted.json" url enabled rule allow old_rule name
+  # Only subscriptions previously managed here may be disabled when removed.
+  while IFS= read -r url; do
+    if ! MFR_URL="$url" "$bin_dir/yq" -e '.filter_urls | contains([strenv(MFR_URL)])' "$wanted" >/dev/null; then
+      if MFR_URL="$url" "$bin_dir/yq" -e '.filters[] | select(.url == strenv(MFR_URL))' "$directory/before.json" >/dev/null; then
+        adg_controls_set_filter "$url" false "$directory/before.json" "$directory/payload.json" || return 1
+      fi
+    fi
+  done < "$directory/owned.txt"
+  enabled=$("$bin_dir/yq" -r '.adblock' "$wanted")
+  while IFS= read -r url; do
+    if ! MFR_URL="$url" "$bin_dir/yq" -e '.filters[] | select(.url == strenv(MFR_URL))' "$directory/before.json" >/dev/null; then
+      MFR_URL="$url" "$bin_dir/yq" -n -o=json '{"url":strenv(MFR_URL),"name":"MFR 广告规则","whitelist":false}' > "$directory/payload.json"
+      adg_api POST filtering/add_url --data-binary "@$directory/payload.json" >/dev/null || return 1
+    fi
+    adg_api GET filtering/status > "$directory/current.json" || return 1
+    adg_controls_set_filter "$url" "$enabled" "$directory/current.json" "$directory/payload.json" || return 1
+  done < "$directory/wanted.txt"
+  # Replace only the module's canonical AAAA rule, retaining other custom rules.
+  "$bin_dir/yq" -o=json '{"rules":[.user_rules[] | select(test("^\\$dnstype=AAAA(,denyallow=[A-Za-z0-9.|-]+)?,dnsrewrite=NOERROR;;$") == false)]}' "$directory/before.json" > "$directory/rules.json" || return 1
+  if [ "$("$bin_dir/yq" -r '.ipv6_filter' "$wanted")" = true ]; then
+    allow=$("$bin_dir/yq" -r '.ipv6_allow | join("|")' "$wanted")
+    rule='$dnstype=AAAA'
+    [ -z "$allow" ] || rule="$rule,denyallow=$allow"
+    rule="$rule,dnsrewrite=NOERROR;;"
+    MFR_RULE="$rule" "$bin_dir/yq" -i '.rules += [strenv(MFR_RULE)]' "$directory/rules.json" || return 1
+  fi
+  adg_api POST filtering/set_rules --data-binary "@$directory/rules.json" >/dev/null || return 1
+  adg_api POST dns_config --data-binary '{"disable_ipv6":false}' >/dev/null || return 1
+  if [ "$enabled" = true ] || [ "$("$bin_dir/yq" -r '.ipv6_filter' "$wanted")" = true ]; then
+    "$bin_dir/yq" -o=json '{"enabled":true,"interval":.interval}' "$directory/before.json" > "$directory/payload.json"
+    adg_api POST filtering/config --data-binary "@$directory/payload.json" >/dev/null || return 1
+    adg_api POST protection --data-binary '{"enabled":true}' >/dev/null || return 1
+  fi
+  adg_api POST cache_clear --data-binary '{}' >/dev/null
+}
+
+adg_controls_restore() {
+  local directory="$1" url enabled
+  while IFS= read -r url; do
+    if MFR_URL="$url" "$bin_dir/yq" -e '.filters[] | select(.url == strenv(MFR_URL))' "$directory/before.json" >/dev/null; then
+      enabled=$(MFR_URL="$url" "$bin_dir/yq" -r '.filters[] | select(.url == strenv(MFR_URL)) | .enabled' "$directory/before.json")
+      adg_controls_set_filter "$url" "$enabled" "$directory/before.json" "$directory/payload.json" || true
+    else
+      MFR_URL="$url" "$bin_dir/yq" -n -o=json '{"url":strenv(MFR_URL),"whitelist":false}' > "$directory/payload.json"
+      adg_api POST filtering/remove_url --data-binary "@$directory/payload.json" >/dev/null || true
+    fi
+  done < "$directory/affected.txt"
+  "$bin_dir/yq" -o=json '{"rules":.user_rules}' "$directory/before.json" > "$directory/payload.json"
+  adg_api POST filtering/set_rules --data-binary "@$directory/payload.json" >/dev/null || true
+  "$bin_dir/yq" -o=json '{"enabled":.enabled,"interval":.interval}' "$directory/before.json" > "$directory/payload.json"
+  adg_api POST filtering/config --data-binary "@$directory/payload.json" >/dev/null || true
+  "$bin_dir/yq" -o=json '{"disable_ipv6":.disable_ipv6}' "$directory/dns-before.json" > "$directory/payload.json"
+  adg_api POST dns_config --data-binary "@$directory/payload.json" >/dev/null || true
+  "$bin_dir/yq" -o=json '{"enabled":.protection_enabled}' "$directory/status-before.json" > "$directory/payload.json"
+  adg_api POST protection --data-binary "@$directory/payload.json" >/dev/null || true
+  adg_api POST cache_clear --data-binary '{}' >/dev/null || true
+}
+
+adg_controls_sync() (
+  umask 077
+  local pref="${preferences_file:-$manage_dir/preferences.json}" digest expected directory stamp="$box_run_state/adg-controls.applied" owned="$manage_dir/adg-owned-urls.json"
+  [ -s "$pref" ] || exit 0
+  "$bin_dir/yq" -e '.adg_controls | tag == "!!map"' "$pref" >/dev/null 2>&1 || exit 0
+  digest=$("$bin_dir/yq" -o=json -I=0 '.adg_controls' "$pref" | busybox sha256sum)
+  expected="$(cat "$adg_pid")|${digest%% *}"
+  [ "$expected" != "$(cat "$stamp" 2>/dev/null)" ] || exit 0
+  directory=$(mktemp -d "$box_run_state/.adg-controls.XXXXXXXX") || exit 1
+  trap 'rm -rf "$directory"' EXIT
+  "$bin_dir/yq" -o=json '.adg_controls' "$pref" > "$directory/wanted.json"
+  adg_controls_valid "$directory/wanted.json" || exit 1
+  adg_controls_effective "$directory/wanted.json" > "$directory/wanted.next" &&
+    mv "$directory/wanted.next" "$directory/wanted.json" || exit 1
+  adg_api GET filtering/status > "$directory/before.json" || exit 1
+  adg_api GET dns_info > "$directory/dns-before.json" || exit 1
+  adg_api GET status > "$directory/status-before.json" || exit 1
+  if [ -s "$owned" ]; then
+    "$bin_dir/yq" -r '.[]' "$owned" > "$directory/owned.txt" || exit 1
+  else
+    "$bin_dir/yq" -r '.filters | .[0:3] | .[].url' "$directory/before.json" > "$directory/owned.txt"
+  fi
+  "$bin_dir/yq" -r '.filter_urls[]' "$directory/wanted.json" > "$directory/wanted.txt"
+  cat "$directory/owned.txt" "$directory/wanted.txt" | busybox sort -u > "$directory/affected.txt"
+  if ! adg_controls_change "$directory"; then
+    adg_controls_restore "$directory"
+    adg_diagnostic '快捷过滤设置失败，已尝试恢复原规则与订阅状态'
+    exit 1
+  fi
+  "$bin_dir/yq" -o=json '.filter_urls' "$directory/wanted.json" > "$owned.next" && mv "$owned.next" "$owned" || exit 1
+  printf '%s\n' "$expected" > "$stamp.next" && mv "$stamp.next" "$stamp"
+)

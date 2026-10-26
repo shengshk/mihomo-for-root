@@ -1,0 +1,21 @@
+#!/system/bin/sh
+# One internal DNS endpoint for runtime YAML, AGH and readiness checks.
+mfr_dns_port=15353
+mfr_dns_address="127.0.0.1:$mfr_dns_port"
+mfr_dns_hex=$(printf '%04X' "$mfr_dns_port")
+
+# Run only after an actual bind failure, not on each readiness poll.
+mfr_dns_port_owners() {
+  local owner pid name command
+  ss -lntup 2>/dev/null | busybox awk -v port="$mfr_dns_port" '
+    $5 ~ (":" port "$") && /users:/ {
+      line=$0; sub(/^.*users:\(\("/, "", line)
+      name=line; sub(/".*$/, "", name)
+      pid=line; sub(/^.*pid=/, "", pid); sub(/[^0-9].*$/, "", pid)
+      if (pid != "") print pid, name
+    }' | busybox sort -u | while read -r pid name; do
+      command=$( { busybox tr "\000" "\n" < "/proc/$pid/cmdline" | busybox head -n 1; } 2>/dev/null)
+      owner="${command##*/}"
+      printf '%s (PID %s)\n' "${owner:-$name}" "$pid"
+    done
+}

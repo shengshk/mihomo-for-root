@@ -1,0 +1,209 @@
+#!/system/bin/sh
+# Independent DNS entry. Upstreams change by API; query failures never select
+# a fallback. A confirmed core exit and a managed stop are separate transitions.
+umask 077
+scripts_dir="${0%/*}"
+. /data/adb/box/settings.ini
+. "$scripts_dir/dns.utils"
+. "$scripts_dir/adg.utils"
+. "$scripts_dir/adg-controls.utils"
+adg_paths
+mkdir -p "$adg_dir" "$box_run_state"
+
+error() { printf '%s\n' "$1" > "$adg_error"; adg_diagnostic "$1"; return 1; }
+release() {
+  [ "${owned:-false}" != true ] || { rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null; }
+  return 0
+}
+acquire() {
+  lock="$box_run_state/adguardhome.lock"
+  local owner stamp now
+  if ! mkdir "$lock" 2>/dev/null; then
+    owner=$(cat "$lock/pid" 2>/dev/null)
+    case "$owner" in
+      ''|*[!0-9]*)
+        stamp=$(stat -c %Y "$lock" 2>/dev/null); now=$(date +%s)
+        [ -n "$stamp" ] && [ $((now - stamp)) -gt 30 ] || return 75 ;;
+      *) kill -0 "$owner" 2>/dev/null && grep -q box.adg "/proc/$owner/cmdline" 2>/dev/null && return 75 ;;
+    esac
+    rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null && mkdir "$lock" 2>/dev/null || return 75
+  fi
+  owned=true
+  printf '%s\n' "$$" > "$lock/pid"
+}
+
+# Capture only this phone's ordinary DNS, independently of proxy application
+# selection. Owner exceptions are strict: no UID-only fallback that exempts netd.
+rules_family() {
+  local tool="$1" action="$2" proto
+  if [ "$action" = remove ]; then
+    for proto in udp tcp; do
+      while "$tool" -w 3 -t nat -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH_DNS 2>/dev/null; do
+        "$tool" -w 3 -t nat -D OUTPUT -p "$proto" --dport 53 -j MFR_AGH_DNS || return 1
+      done
+    done
+    "$tool" -w 3 -t nat -F MFR_AGH_DNS 2>/dev/null
+    "$tool" -w 3 -t nat -X MFR_AGH_DNS 2>/dev/null
+    return 0
+  fi
+  # Idempotent: do not flush a working chain on each network notification.
+  if ! "$tool" -w 3 -t nat -C MFR_AGH_DNS -p tcp -j REDIRECT --to-ports 1054 >/dev/null 2>&1; then
+    "$tool" -w 3 -t nat -N MFR_AGH_DNS 2>/dev/null || "$tool" -w 3 -t nat -F MFR_AGH_DNS || return 1
+    "$tool" -w 3 -t nat -A MFR_AGH_DNS -m owner --uid-owner 0 --gid-owner "$adg_group" -j RETURN || return 1
+    "$tool" -w 3 -t nat -A MFR_AGH_DNS -m owner --uid-owner 0 --gid-owner 3005 -j RETURN || return 1
+    "$tool" -w 3 -t nat -A MFR_AGH_DNS -p udp -j REDIRECT --to-ports 1054 || return 1
+    "$tool" -w 3 -t nat -A MFR_AGH_DNS -p tcp -j REDIRECT --to-ports 1054 || return 1
+  fi
+  for proto in udp tcp; do
+    "$tool" -w 3 -t nat -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH_DNS 2>/dev/null ||
+      "$tool" -w 3 -t nat -I OUTPUT 1 -p "$proto" --dport 53 -j MFR_AGH_DNS || return 1
+  done
+}
+v6_block() {
+  local action="$1" proto
+  if [ "$action" = remove ]; then
+    for proto in udp tcp; do
+      while ip6tables -w 3 -t filter -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH_V6 2>/dev/null; do
+        ip6tables -w 3 -t filter -D OUTPUT -p "$proto" --dport 53 -j MFR_AGH_V6 || return 1
+      done
+    done
+    ip6tables -w 3 -t filter -F MFR_AGH_V6 2>/dev/null
+    ip6tables -w 3 -t filter -X MFR_AGH_V6 2>/dev/null
+    return 0
+  fi
+  if ! ip6tables -w 3 -t filter -C MFR_AGH_V6 -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null; then
+    ip6tables -w 3 -t filter -N MFR_AGH_V6 2>/dev/null || ip6tables -w 3 -t filter -F MFR_AGH_V6 || return 1
+    ip6tables -w 3 -t filter -A MFR_AGH_V6 -m owner --uid-owner 0 --gid-owner "$adg_group" -j RETURN || return 1
+    ip6tables -w 3 -t filter -A MFR_AGH_V6 -m owner --uid-owner 0 --gid-owner 3005 -j RETURN || return 1
+    ip6tables -w 3 -t filter -A MFR_AGH_V6 -j REJECT --reject-with icmp6-port-unreachable || return 1
+  fi
+  for proto in udp tcp; do
+    ip6tables -w 3 -t filter -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH_V6 2>/dev/null ||
+      ip6tables -w 3 -t filter -I OUTPUT 1 -p "$proto" --dport 53 -j MFR_AGH_V6 || return 1
+  done
+}
+capture() {
+  if [ "$1" = remove ]; then
+    rules_family iptables remove || return 1
+    rules_family ip6tables remove || return 1
+    v6_block remove || return 1
+    rm -f "$box_run_state/adguardhome.capture"
+    return 0
+  fi
+  rules_family iptables install || return 1
+  if ip6tables -w 3 -t nat -S OUTPUT >/dev/null 2>&1; then
+    rules_family ip6tables install || return 1
+    v6_block remove
+    printf 'dual\n' > "$box_run_state/adguardhome.capture"
+  else
+    # No NAT6 on many Android kernels. Fail closed for IPv6 DNS transport;
+    # IPv4 resolvers can still return allowed AAAA records.
+    v6_block install || return 1
+    printf 'ipv4-ipv6-reject\n' > "$box_run_state/adguardhome.capture"
+  fi
+}
+stop_daemon() {
+  if adg_alive; then
+    local p count=0
+    p=$(cat "$adg_pid"); kill "$p" 2>/dev/null
+    while kill -0 "$p" 2>/dev/null && [ "$count" -lt 5 ]; do sleep 1; count=$((count+1)); done
+    kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null
+  fi
+  rm -f "$adg_pid" "$adg_state"
+}
+start_daemon() {
+  adg_alive && return 0
+  [ -x "$bin_dir/AdGuardHome" ] || { error 'AGH 内核缺失'; return 1; }
+  [ -s "$adg_config" ] || cp "$box_dir/templates/AdGuardHome.yaml" "$adg_config" || return 1
+  # Each launch starts closed. Never reuse an old network resolver or Fake-IP
+  # upstream during boot; cache preferences and user rules remain untouched.
+  "$bin_dir/yq" -i '.dns.upstream_dns = ["127.0.0.1:1"] | .dns.upstream_dns_file = "" |
+    .dns.fallback_dns = [] | .dns.use_private_ptr_resolvers = false | .dns.local_ptr_upstreams = []' "$adg_config" || return 1
+  if [ "$(cat "$box_run_state/adguardhome.capture" 2>/dev/null)" = dual ]; then
+    "$bin_dir/yq" -i '.dns.bind_hosts = ["127.0.0.1", "::1"]' "$adg_config" || return 1
+  else
+    "$bin_dir/yq" -i '.dns.bind_hosts = ["127.0.0.1"]' "$adg_config" || return 1
+  fi
+  "$bin_dir/AdGuardHome" --check-config -c "$adg_config" -w "$adg_dir" > "$box_run/adguardhome-check.log" 2>&1 || {
+    error 'AGH 配置错误'; return 1;
+  }
+  SSL_CERT_DIR=/system/etc/security/cacerts:/apex/com.android.conscrypt/cacerts nohup busybox setuidgid "0:$adg_group" "$bin_dir/AdGuardHome" -c "$adg_config" -w "$adg_dir" --no-check-update \
+    </dev/null > "$box_run/adguardhome.log" 2>&1 &
+  printf '%s\n' "$!" > "$adg_pid"
+  rm -f "$adg_state"
+  local count=0
+  while [ "$count" -lt 8 ]; do
+    adg_api GET status >/dev/null && return 0
+    sleep 1; count=$((count+1))
+  done
+  error 'AGH 启动失败'
+}
+switch_upstream() {
+  local mode="$1" snapshot servers expected json
+  if [ "$mode" = auto ]; then
+    if adg_core_alive; then mode=mihomo; else mode=system; fi
+  fi
+  if [ "$mode" = mihomo ]; then
+    # The local upstream address stays the same across Wi-Fi/mobile changes.
+    # Include its underlying network so AGH cannot reuse the old network cache.
+    snapshot=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network)
+    expected="mihomo|$(cat "$box_pid" 2>/dev/null)|$snapshot"
+    [ "$expected" != "$(cat "$adg_state" 2>/dev/null)" ] || return 0
+    # Check the actual DNS listener, not just an existing PID or controller.
+    # No system fallback if the core is alive but its DNS is unready.
+    adg_dns_ready || { error 'Mihomo DNS 未就绪'; return 1; }
+    servers="$mfr_dns_address"
+  else
+    snapshot=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network)
+    servers=${snapshot##*\|}
+    # No current network means a closed local upstream, never AGH defaults.
+    [ -n "$servers" ] || servers='127.0.0.1:1'
+    expected="system|$snapshot"
+  fi
+  if [ "$expected" = "$(cat "$adg_state" 2>/dev/null)" ]; then return 0; fi
+  json=$(printf '%s\n' "$servers" | busybox awk 'BEGIN {printf "["} {for(i=1;i<=NF;i++){if(n++)printf ",";printf "\"%s\"",$i}} END {print "]"}')
+  # A previous failed cache clear leaves no committed state, so the next sync
+  # retries it. Changing cache settings manually in AGH remains possible.
+  adg_api POST dns_config --data-binary "{\"upstream_dns\":$json,\"upstream_dns_file\":\"\",\"fallback_dns\":[],\"use_private_ptr_resolvers\":false,\"local_ptr_upstreams\":[]}" >/dev/null || {
+    error 'AGH 上游切换失败'; return 1;
+  }
+  adg_api POST cache_clear --data-binary '{}' >/dev/null || { error 'AGH 缓存清理失败'; return 1; }
+  printf '%s\n' "$expected" > "$adg_state.next.$$" && mv "$adg_state.next.$$" "$adg_state" || return 1
+  rm -f "$adg_error"
+}
+
+trap release EXIT
+trap 'exit 1' INT TERM HUP
+case "$1" in
+  stop)
+    acquire || exit $?
+    capture remove || { error 'AGH DNS 接管撤销失败'; exit 1; }
+    stop_daemon; rm -f "$adg_error" ;;
+  sync|before-stop|replace-config)
+    # Background network sync must not race a managed start/stop transaction.
+    if [ "${MFR_ADG_OPERATION:-0}" != 1 ] && [ -d "$manage_dir/operation.lock" ]; then exit 75; fi
+    acquire || exit $?
+    if [ "$1" = replace-config ]; then
+      # Internal, operation-locked recovery path. Keep capture installed while
+      # replacing the daemon, so a reset never silently bypasses DNS filtering.
+      [ "${MFR_ADG_OPERATION:-0}" = 1 ] && [ -f "${2:-}" ] || exit 1
+      if [ "${MFR_ADG_RESTORE:-0}" != 1 ]; then
+        "$bin_dir/AdGuardHome" --check-config -c "$2" -w "$adg_dir" > "$box_run/adguardhome-check.log" 2>&1 || exit 1
+      fi
+      cp "$2" "$adg_config.next" && chmod 600 "$adg_config.next" || exit 1
+      stop_daemon
+      mv "$adg_config.next" "$adg_config" || exit 1
+      rm -f "$box_run_state/adg-controls.applied" "$manage_dir/adg-owned-urls.json"
+    fi
+    if [ "${adguardhome_enabled:-false}" != true ] || [ -f /data/adb/modules/box_for_root/disable ]; then
+      capture remove || { error 'AGH DNS 接管撤销失败'; exit 1; }
+      stop_daemon; rm -f "$adg_error"; exit 0
+    fi
+    # On failures capture stays installed: no hidden public/system DNS bypass.
+    capture install || { error 'AGH DNS 接管失败'; exit 1; }
+    start_daemon || exit 1
+    mode=auto; [ "$1" != before-stop ] || mode=system
+    switch_upstream "$mode" || exit 1
+    [ "$1" = before-stop ] || [ "${MFR_SKIP_ADG_CONTROLS:-0}" = 1 ] || adg_controls_sync || { error 'AGH 快捷设置应用失败'; exit 1; } ;;
+  *) exit 1 ;;
+esac

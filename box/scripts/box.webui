@@ -1,0 +1,32 @@
+#!/system/bin/sh
+
+# Only the local manager's WebUI bridge calls this. No command logging or secret files.
+. /data/adb/box/settings.ini
+
+case "$bin_name" in
+  mihomo)
+    config="$mihomo_config"
+    # Prefer the configuration actually used by a running core.
+    if [ -s "$box_pid" ] && [ -s "$box_dir/mihomo/.box-runtime.yaml" ]; then
+      core_pid=$(cat "$box_pid")
+      case "$core_pid" in
+        ''|*[!0-9]*) ;;
+        *) if kill -0 "$core_pid" 2>/dev/null; then config="$box_dir/mihomo/.box-runtime.yaml"; fi ;;
+      esac
+    fi
+    expression='{"controller": .["external-controller"], "secret": (.secret // "")}'
+    ;;
+  *)
+    printf '%s\n' '当前内核不支持此面板。' >&2
+    exit 1
+    ;;
+esac
+
+if [ ! -s "$config" ] || [ ! -x "$bin_dir/yq" ]; then
+  printf '%s\n' '未找到内核配置或配置读取工具。' >&2
+  exit 1
+fi
+if ! "$bin_dir/yq" -o=json -I=0 "$expression" "$config" 2>/dev/null; then
+  printf '%s\n' '配置读取失败，请检查内核配置。' >&2
+  exit 1
+fi

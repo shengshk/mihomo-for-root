@@ -1,0 +1,63 @@
+#!/system/bin/sh
+# One sleeping BusyBox daemon, only while scheduled subscriptions exist.
+umask 077
+scripts_dir="${0%/*}"
+. /data/adb/box/settings.ini
+. "$scripts_dir/cron.utils"
+yq="$bin_dir/yq"
+cron_dir="$manage_dir/cron"
+pid_file="$box_run_state/subscription-cron.pid"
+alive() {
+  local pid
+  pid=$(cat "$pid_file" 2>/dev/null)
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null && grep -q crond "/proc/$pid/cmdline" && grep -q "$cron_dir" "/proc/$pid/cmdline"
+}
+stop() {
+  if alive; then kill "$(cat "$pid_file")" 2>/dev/null; fi
+  rm -f "$pid_file"
+}
+case "$1" in
+  stop) stop ;;
+  sync)
+    mkdir -p "$cron_dir" "$box_run_state"
+    # The manager serializes profile changes; atomic replacement lets crond
+    # finish a started refresh without ever reading half of a new table.
+    jobs=$(mktemp "$cron_dir/.jobs.XXXXXXXX") || exit 1
+    trap 'rm -f "$jobs" "$jobs.table"' EXIT
+    [ ! -s "$manage_dir/profiles.json" ] || "$yq" -r '.profiles[] | select((.url // "") != "" and (.cron // "") != "") | [.id, .cron] | @tsv' "$manage_dir/profiles.json" > "$jobs" || exit 1
+    : > "$jobs.table"
+    while IFS="$(printf '\t')" read -r id expression; do
+      [ -n "$id" ] || continue
+      case "$id" in ''|*[!a-z0-9_-]*) exit 1 ;; esac
+      mfr_cron_valid "$expression" || exit 1
+      printf '%s /system/bin/sh %s/box.cron refresh %s >/dev/null 2>&1\n' "$expression" "$scripts_dir" "$id" >> "$jobs.table"
+    done < "$jobs"
+    if [ ! -s "$jobs.table" ]; then
+      stop
+      rm -f "$cron_dir/root" "$cron_dir/cron.update"
+      exit 0
+    fi
+    busybox crond --help >/dev/null 2>&1 || exit 1
+    mv "$jobs.table" "$cron_dir/root" || exit 1
+    chmod 600 "$cron_dir/root"
+    # BusyBox reloads this named user on its next minute boundary.
+    printf 'root\n' > "$cron_dir/cron.update"
+    if ! alive; then
+      unset MFR_REQUEST_FILE MFR_PAYLOAD
+      SHELL=/system/bin/sh nohup busybox crond -f -c "$cron_dir" -L /dev/null </dev/null >/dev/null 2>&1 &
+      printf '%s\n' "$!" > "$pid_file"
+    fi
+    ;;
+  refresh)
+    # Read current metadata again: a removed/disabled schedule must not run
+    # merely because crond had already queued its old line.
+    [ ! -f /data/adb/modules/box_for_root/disable ] || exit 0
+    id="$2"
+    case "$id" in ''|*[!a-z0-9_-]*) exit 1 ;; esac
+    MFR_ID="$id" "$yq" -e '.profiles[] | select(.id == strenv(MFR_ID) and (.url // "") != "" and (.cron // "") != "")' "$manage_dir/profiles.json" >/dev/null 2>&1 || exit 0
+    MFR_REQUEST_FILE= MFR_PAYLOAD=$(MFR_ID="$id" "$yq" -n -o=json -I=0 '{"id":strenv(MFR_ID)}' | busybox base64 | tr -d '\n') \
+      "$scripts_dir/box.manager" profile-update > "$box_run/subscription-refresh.log" 2>&1
+    ;;
+  *) exit 1 ;;
+esac
