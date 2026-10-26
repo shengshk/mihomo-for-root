@@ -36,6 +36,8 @@ time.sleep(60)
         self.write('scripts/ports.utils',(ROOT/'box/scripts/ports.utils').read_text().replace('mfr_dns_port=15353',f'mfr_dns_port={self.port}'))
         utils=(ROOT/'box/scripts/adg.utils').read_text()
         self.write('scripts/adg.utils', utils)
+        for name in ('config.utils', 'network.utils'):
+            self.write('scripts/'+name, (ROOT/'box/scripts'/name).read_text())
         service=(ROOT/'box/scripts/box.service').read_text()
         self.write('functions', '\n'.join(re.search(r'^'+name+r'\(\) \{.*?^\}',service,re.M|re.S).group() for name in ('wait_mihomo_dns','startup_adg_step','box_run_bin')))
         self.write('vars', f'''export PATH="{self.base}/bin:$PATH"
@@ -50,6 +52,8 @@ bin_log="$box_dir/run/mihomo.log"
 box_user_group=0:0
 adguardhome_enabled=true
 . "$scripts_dir/adg.utils"
+. "$scripts_dir/config.utils"
+. "$scripts_dir/network.utils"
 ''')
         self.write('scripts/box.adg', f'''#!/bin/bash
 . "{self.base}/vars"
@@ -184,6 +188,19 @@ printf '%s\\n' 'udp UNCONN 0 0 *:{self.port} *:* users:(("com.other.vpn",pid=999
         self.assertLess(time.monotonic()-start,4)
         self.assertEqual(self.events(),[])
         self.assertIn('超时',(self.base/'errors').read_text())
+
+
+    def test_wifi_policy_cancels_during_initialization_without_switching_upstream(self):
+        body='mfr_start_gate() {\n  if [ -f "$box_pid" ]; then return 77; fi\n  return 0\n}\nbox_run_bin'
+        result=subprocess.run(['bash','-c',self.command(body)],env={**self.env,'MFR_FAKE_DELAY':'60'},capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,77,result.stderr)
+        self.assertEqual(self.events(),['prepared','system'])
+
+    def test_operation_owner_defers_dns_watcher_until_unlock(self):
+        (self.base/'manage/operation.lock').mkdir(parents=True)
+        result=subprocess.run(['bash','-c',self.command()],env={**self.env,'MFR_FAKE_DELAY':'.1'},capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(self.events(),['prepared','system','mihomo','committed'])
 
 if __name__ == '__main__':
     unittest.main()

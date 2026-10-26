@@ -104,15 +104,15 @@ apply_current() {
     MFR_POLICY_LOCK_HELD=1 "$scripts_dir/box.policy" reconcile >> "$work/apply.log" 2>&1
     result=$?
     [ "$result" = 0 ] || return "$result"
-    MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" sync
-    return $?
+    return 0
   fi
   if running; then
-    "$scripts_dir/box.service" restart >> "$work/apply.log" 2>&1 || return 1
-    running || return 1
+    "$scripts_dir/box.service" restart >> "$work/apply.log" 2>&1
+    result=$?
+    case "$result" in 0) running || return 1 ;; 77) : ;; *) return "$result" ;; esac
   fi
   MFR_POLICY_LOCK_HELD=1 "$scripts_dir/box.policy" reconcile >> "$work/apply.log" 2>&1 || return 1
-  MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" sync >> "$work/apply.log" 2>&1
+  return 0
 }
 
 activate_file() {
@@ -585,8 +585,7 @@ case "$1" in
     "$work/mihomo" -t -d "$box_dir/mihomo" -f "$test_config" > "$work/check.log" 2>&1 || fail '新内核未通过当前配置检查，现有内核已保留。'
     was_running=false; running && was_running=true
     if [ "$was_running" = true ]; then
-      "$scripts_dir/box.iptables" disable > "$work/stop.log" 2>&1
-      "$scripts_dir/box.service" stop >> "$work/stop.log" 2>&1
+      "$scripts_dir/box.service" stop > "$work/stop.log" 2>&1
     fi
     cp "$bin_path" "$work/mihomo.old"
     mv "$work/mihomo" "$bin_path"

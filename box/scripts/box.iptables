@@ -1902,21 +1902,9 @@ apply_external_ap_rules() {
   }
 }
 
-case "${bin_name}" in
-  "mihomo")
-    mihomo_mode=$(busybox awk '!/^ *#/ && /mode: / { print $2;found=1; exit } END{ if(!found) print "rules" }' "${mihomo_config}" 2>/dev/null)
-    mihomo_enhanced_mode=$(busybox awk '!/^ *#/ && /enhanced-mode: / { print $2;found=1; exit } END{ if(!found) print "fake-ip" }' "${mihomo_config}" 2>/dev/null)
-    fake_ip_range=$(busybox awk '!/^ *#/ && /fake-ip-range:/ { print $2; found=1; exit } END { if (!found) print "198.18.0.1/16" }' "${mihomo_config}" 2>/dev/null)
-    fake_ip6_range=$(busybox awk '!/^ *#/ && /fake-ip-range6:/ { print $2; found=1; exit } END { if (!found) print "fc00::/18" }' "${mihomo_config}" 2>/dev/null)
-    mihomo_dns_port=$(sed -n '/^dns:/,/^[^ ]/p' "${mihomo_config}" | grep -E '^[^#]*listen:.*:[0-9]+' | grep -Eo '[0-9]+' | tail -n 1)
-    mihomo_dns_port=${mihomo_dns_port:-$mfr_dns_port}
-    if [[ "${network_mode}" == @(mixed|tun) ]]; then
-      tun_device=$(busybox awk '!/^ *#/ && /device: / { print $2;found=1; exit } END{ if(!found) print "meta" }' "${mihomo_config}" 2>/dev/null)
-      stack=$(busybox awk '!/^ *#/ && /stack: / { print $2;found=1; exit } END{ if(!found) print "'"${stack}"'" }' "${mihomo_config}" 2>/dev/null)
-    fi
-    ;;
-  *) exit 1 ;;
-esac
+. "$scripts_dir/config.utils"
+. "$scripts_dir/rules.utils"
+mfr_config_read "$mihomo_config" || exit 1
 
 box_etc() {
   case "${bin_name}" in
@@ -2472,6 +2460,10 @@ prepare_rule_apply() {
   }
   prepare_cnip_force_proxy_uids
   log_iptables_results
+  if mfr_rules_absent; then
+    log Debug '接管已撤销，直接应用当前模式。'
+    return 0
+  fi
   cleanup_mode="$(cleanup_mode_for_apply)"
   log Debug "iptables 定向清理模式: ${cleanup_mode}"
   cleanup_iptables_for_mode "${cleanup_mode}"
@@ -2483,6 +2475,7 @@ apply_redirect_family() {
   else
     log Error "${iptables} 透明代理规则创建失败。"
     stop_redirect > /dev/null 2>&1
+    return 1
   fi
 }
 
@@ -2492,6 +2485,7 @@ apply_tproxy_family() {
   else
     log Error "${iptables} 透明代理规则创建失败。"
     stop_tproxy > /dev/null 2>&1
+    return 1
   fi
 }
 
@@ -2507,6 +2501,7 @@ apply_enhance_family() {
     log Error "${iptables} 透明代理规则创建失败。"
     stop_redirect > /dev/null 2>&1
     stop_tproxy > /dev/null 2>&1
+    return 1
   fi
 }
 
@@ -2546,12 +2541,23 @@ log_iptables_results() {
   [ -n "$applied_uids" ] && log Debug "UID 列表: ${applied_uids}"
 }
 
-runtime_loaded="false"
-if [ "$1" = "disable" ]; then
+if [ "$1" = disable ]; then
+  cleanup_mode=all
   if runtime_load >/dev/null 2>&1; then
-    runtime_loaded="true"
+    cleanup_mode="${network_mode:-all}"
+    # Upgrade old snapshots through the same typed boundary before using any
+    # address in a command. Old flow-YAML parsing could have saved invalid text.
+    if { [ -n "$fake_ip_range" ] && ! mfr_valid_cidr "$fake_ip_range" 4; } ||
+       { [ -n "$fake_ip6_range" ] && ! mfr_valid_cidr "$fake_ip6_range" 6; }; then
+      mfr_config_read "$mihomo_config" || exit 1
+      cleanup_mode=all
+    fi
   fi
+  probe_user_group || :
+  mfr_rules_disable "$cleanup_mode"
+  exit $?
 fi
+case "$1" in enable|renew) mfr_rules_mark dirty || exit 1 ;; *) exit 1 ;; esac
 
 if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
   case "$1" in
@@ -2568,13 +2574,13 @@ if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
           log Info "TPROXY: 正在创建透明代理规则。"
 
           iptables="$IPV"
-          apply_tproxy_family
+          apply_tproxy_family || exit 1
 
           if [ "${ipv6}" = "true" ]; then
             log Debug "启用 IPv6。"
             ipv6_enable
             iptables="$IP6V"
-            apply_tproxy_family
+            apply_tproxy_family || exit 1
           else
             disable_ipv6
             log Warning "已禁用 IPv6。"
@@ -2584,13 +2590,13 @@ if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
           log Info "Redirect: 正在创建透明代理规则。"
 
           iptables="$IPV"
-          apply_redirect_family
+          apply_redirect_family || exit 1
 
           if [ "${ipv6}" = "true" ]; then
             log Debug "启用 IPv6。"
             ipv6_enable
             iptables="$IP6V"
-            apply_redirect_family
+            apply_redirect_family || exit 1
           else
             disable_ipv6
             log Warning "已禁用 IPv6。"
@@ -2601,13 +2607,13 @@ if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
 
           iptables="$IPV"
           wait_tun_ready
-          apply_mixed_family
+          apply_mixed_family || exit 1
 
           if [ "${ipv6}" = "true" ]; then
             log Debug "启用 IPv6。"
             ipv6_enable
             iptables="$IP6V"
-            apply_mixed_family
+            apply_mixed_family || exit 1
           else
             disable_ipv6
             log Warning "已禁用 IPv6。"
@@ -2617,13 +2623,13 @@ if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
           log Info "Enhance: 正在创建透明代理规则。"
 
           iptables="$IPV"
-          apply_enhance_family
+          apply_enhance_family || exit 1
 
           if [ "${ipv6}" = "true" ]; then
             log Debug "启用 IPv6。"
             ipv6_enable
             iptables="$IP6V"
-            apply_enhance_family
+            apply_enhance_family || exit 1
           else
             disable_ipv6
             log Warning "已禁用 IPv6。"
@@ -2635,23 +2641,9 @@ if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
         ;;
       esac
       runtime_save
+      mfr_rules_mark applied || exit 1
       [ $1 = "renew" ] && log Debug "重启 iptables 透明代理规则完成。"
       bin_alive && log Info "${bin_name} 已连接。"
-      ;;
-    disable)
-      cleanup_mode="all"
-      [ "${runtime_loaded}" = "true" ] && cleanup_mode="${network_mode:-all}"
-      ipv6_enable
-      probe_user_group || log Error "检测 BOX 用户组失败，请确保 ${bin_name} 内核已启动。"
-      log Warning "正在清理 iptables 透明代理规则。"
-
-      cleanup_iptables_for_mode "${cleanup_mode}"
-
-      cleanup_cn_ipset_if_needed "${2:-keep}"
-
-      runtime_clear
-
-      log Info "iptables 透明代理规则清理完成。"
       ;;
     *)
       echo "${red}$0 $1 未知命令${normal}"
@@ -2672,35 +2664,22 @@ else
 
       [ -n "${packages_list}" ] && log Debug "代理模式: $proxy_mode (${packages_list[*]})"
 
-      apply_tun_family
+      apply_tun_family || exit 1
 
       if [ "${ipv6}" = "true" ]; then
         log Debug "启用 IPv6。"
         ipv6_enable
         iptables="$IP6V"
-        apply_tun_family
+        apply_tun_family || exit 1
       else
         disable_ipv6
         log Warning "已禁用 IPv6。"
       fi
 
       runtime_save
+      mfr_rules_mark applied || exit 1
       [ $1 = "renew" ] && log Info "重启 iptables TUN 规则完成。"
       bin_alive && log Info "${bin_name} 已连接。"
-      ;;
-    disable)
-      cleanup_mode="all"
-      [ "${runtime_loaded}" = "true" ] && cleanup_mode="${network_mode:-all}"
-      ipv6_enable
-      probe_user_group || log Error "检测 BOX 用户组失败，请确保 ${bin_name} 内核已启动。"
-      log Warning "正在清理 TUN 规则。"
-
-      cleanup_iptables_for_mode "${cleanup_mode}"
-      cleanup_cn_ipset_if_needed "${2:-keep}"
-
-      runtime_clear
-
-      log Info "TUN 规则清理完成。"
       ;;
     *)
       echo "${red}$0: '$1' 未知命令${normal}"

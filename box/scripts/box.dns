@@ -68,11 +68,14 @@ case "$1" in
     printf '%s\n' "$$" > "$watch_pid"
     trap 'cleanup; [ "$(cat "$watch_pid" 2>/dev/null)" != "$$" ] || rm -f "$watch_pid"' EXIT
     mfr_events_open dns || exit 1
+    retries=5
     while pidof mihomo >/dev/null 2>&1; do
       . /data/adb/box/settings.ini
       refresh
       mfr_events_ensure
-      mfr_events_wait "$(mfr_network_interval)"
+      delay=$(mfr_network_interval)
+      if [ "$retries" -gt 0 ]; then delay=2; retries=$((retries-1)); fi
+      mfr_events_wait "$delay" && retries=5
     done
     ;;
   refresh) refresh ;;

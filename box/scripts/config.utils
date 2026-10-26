@@ -1,0 +1,75 @@
+#!/system/bin/sh
+# Typed runtime configuration boundary. Never feed YAML text to firewall tools.
+mfr_config_error() {
+  log Error "Mihomo 运行配置字段无效：$1"
+  return 1
+}
+
+mfr_valid_cidr() {
+  busybox awk -v value="$1" -v family="$2" '
+    function v4(s, a,n,i) {
+      n=split(s,a,"."); if(n!=4) return 0
+      for(i=1;i<=4;i++) if(a[i]!~/^[0-9]+$/ || length(a[i])>3 || a[i]+0>255) return 0
+      return 1
+    }
+    function v6(s, a,n,i,c,t,last) {
+      if(index(s,".")) {
+        last=s; sub(/^.*:/,"",last); if(!v4(last)) return 0
+        sub(/[^:]*$/,"0:0",s)
+      }
+      if(s!~/^[0-9a-fA-F:]+$/ || s ~ /:::/) return 0
+      t=s; c=gsub(/::/,"@",t); if(c>1) return 0
+      if(!c && (s~/^:/ || s~/:$/)) return 0
+      n=split(s,a,":"); t=0
+      for(i=1;i<=n;i++) if(a[i]!="") {
+        if(length(a[i])>4 || a[i]!~/^[0-9a-fA-F]+$/) return 0
+        t++
+      }
+      return c ? t<8 : t==8
+    }
+    BEGIN {
+      if(split(value,p,"/")!=2 || p[2]!~/^[0-9]+$/) exit 1
+      if(family==4) exit !(p[2]+0<=32 && v4(p[1]))
+      if(family==6) exit !(p[2]+0<=128 && v6(p[1]))
+      exit 1
+    }'
+}
+
+mfr_config_read() {
+  local values listen
+  values=$("$bin_dir/yq" -er '
+    [.mode // "rule", .dns."enhanced-mode" // "redir-host",
+     .dns."fake-ip-range" // "", .dns."fake-ip-range6" // "",
+     .dns.listen // "", .tun.device // "Meta", .tun.stack // "gvisor"] |
+    select([.[] | select(tag != "!!str" or test("[|\\r\\n]"))] | length == 0) |
+    join("|")' "$1" 2>/dev/null) || { mfr_config_error '字段类型'; return 1; }
+  IFS='|' read -r mihomo_mode mihomo_enhanced_mode fake_ip_range fake_ip6_range listen tun_device stack <<VALUES
+$values
+VALUES
+  case "$mihomo_mode" in rule|global|direct) ;; *) mfr_config_error mode; return 1 ;; esac
+  case "$mihomo_enhanced_mode" in
+    fake-ip)
+      [ -z "$fake_ip_range" ] || mfr_valid_cidr "$fake_ip_range" 4 || { mfr_config_error fake-ip-range; return 1; }
+      [ -z "$fake_ip6_range" ] || mfr_valid_cidr "$fake_ip6_range" 6 || { mfr_config_error fake-ip-range6; return 1; } ;;
+    redir-host) fake_ip_range=''; fake_ip6_range='' ;;
+    *) mfr_config_error enhanced-mode; return 1 ;;
+  esac
+  mihomo_dns_port=${listen##*:}
+  [ -n "$listen" ] || mihomo_dns_port=$mfr_dns_port
+  case "$mihomo_dns_port" in ''|*[!0-9]*) mfr_config_error dns.listen; return 1 ;; esac
+  [ "$mihomo_dns_port" -gt 0 ] && [ "$mihomo_dns_port" -le 65535 ] || { mfr_config_error dns.listen; return 1; }
+  case "$tun_device" in ''|*[!A-Za-z0-9_.-]*) mfr_config_error tun.device; return 1 ;; esac
+  [ "${#tun_device}" -le 15 ] || { mfr_config_error tun.device; return 1; }
+  case "$stack" in gvisor|system|mixed) ;; *) mfr_config_error tun.stack; return 1 ;; esac
+}
+
+mfr_millis() {
+  local up rest fraction
+  read -r up rest < /proc/uptime
+  fraction="${up#*.}000"; fraction=${fraction:0:3}
+  printf '%s\n' "$(( ${up%%.*} * 1000 + 1$fraction - 1000 ))"
+}
+
+mfr_phase_done() {
+  log Info "阶段 $1：$(( $(mfr_millis) - $2 )) ms"
+}

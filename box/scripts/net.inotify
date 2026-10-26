@@ -261,7 +261,6 @@ start_service_if_needed() {
   fi
 
   "${SCRIPTS_DIR}/box.service" start
-  "${SCRIPTS_DIR}/box.iptables" enable
   control_log_msg "[启动] 服务已启动"
 }
 
@@ -271,7 +270,6 @@ stop_service_if_needed() {
     return 0
   fi
 
-  "${SCRIPTS_DIR}/box.iptables" disable
   "${SCRIPTS_DIR}/box.service" stop
   control_log_msg "[停止] 服务已停止"
 }

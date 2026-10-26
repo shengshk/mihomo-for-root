@@ -22,7 +22,6 @@ wait_for_data_ready() {
 refresh_box() {
   if [ -f "/data/adb/box/run/box.pid" ]; then
     "${scripts_dir}/box.service" stop > "/dev/null" 2>&1
-    "${scripts_dir}/box.iptables" disable > "/dev/null" 2>&1
   fi
 }
 
@@ -88,7 +87,6 @@ if [ -f "$file_settings" ] && [ -r "$file_settings" ] && [ -s "$file_settings" ]
   wait_for_data_ready
   refresh_box
   start_service
-  enable_iptables
 fi
 
 start_inotifyd

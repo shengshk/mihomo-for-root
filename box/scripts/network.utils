@@ -112,6 +112,22 @@ mfr_wifi_matches() {
     ((.wifi_pause_ssids // []) | contains([strenv(MFR_SSID)]))' "$preferences_file" >/dev/null 2>&1
 }
 
+# Startup may span a handoff. Recheck before launching and before committing;
+# 75 means observation is temporarily unavailable, 77 means policy cancellation.
+mfr_start_gate() {
+  local intent="${manage_dir:-$box_dir/manage}/service-intent" ssid
+  [ ! -f /data/adb/modules/box_for_root/disable ] || return 77
+  [ "$(cat "$intent" 2>/dev/null)" != stopped ] || return 77
+  [ -s "${preferences_file:-}" ] || return 0
+  "$bin_dir/yq" -e '.wifi_pause_enabled == true' "$preferences_file" >/dev/null 2>&1 || return 0
+  ssid=$(mfr_current_ssid) || return 75
+  if mfr_wifi_matches "$ssid"; then
+    printf '%s\n' "$ssid" > "$box_run_state/wifi-paused"
+    return 77
+  fi
+  return 0
+}
+
 # Pure state decision, also exercised without changing the phone network.
 mfr_policy_decision() {
   local wanted="$1" disabled="$2" live="$3" paused="$4" matches="$5" explicit="$6"

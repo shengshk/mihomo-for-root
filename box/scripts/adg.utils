@@ -24,16 +24,17 @@ adg_core_alive() {
 adg_dns_ready() {
   # Readiness is the core's own bound DNS socket, not a known-public-IP test:
   # a working Fake-IP resolver intentionally returns synthetic addresses.
-  local p inode fd target
+  local p inodes
   p=$(cat "$box_pid" 2>/dev/null)
   adg_core_alive || return 1
-  for inode in $(busybox awk -v endpoint="0100007F:$mfr_dns_hex" '$2 == endpoint {print $10}' "/proc/$p/net/udp" 2>/dev/null); do
-    for fd in /proc/"$p"/fd/*; do
-      target=$(readlink "$fd" 2>/dev/null)
-      [ "$target" != "socket:[$inode]" ] || return 0
-    done
-  done
-  return 1
+  inodes=$(busybox awk -v endpoint="0100007F:$mfr_dns_hex" '$2 == endpoint {print $10}' "/proc/$p/net/udp" 2>/dev/null)
+  [ -n "$inodes" ] || return 1
+  # Resolve the FD table in one process, not one readlink process per descriptor.
+  busybox ls -ln "/proc/$p/fd" 2>/dev/null | busybox awk -v wanted="$inodes" '
+    BEGIN {n=split(wanted,a,/[^0-9]+/);for(i=1;i<=n;i++) if(a[i]!="") valid[a[i]]=1}
+    $NF ~ /^socket:\[[0-9]+\]$/ {v=$NF;sub(/^socket:\[/,"",v);sub(/\]$/,"",v);if(v in valid) found=1}
+    END {exit !found}'
+
 }
 # Diagnostics survive recovery/cleanup; no request bodies, replies or query args.
 adg_diagnostic() (
@@ -107,6 +108,7 @@ adg_health_needed() {
   [ "${adguardhome_enabled:-false}" = true ] || return 1
   [ ! -f /data/adb/modules/box_for_root/disable ] || return 0
   adg_alive || return 0
+  [ ! -s "$adg_error" ] || return 0
   local applied
   IFS='|' read -r applied _ < "$adg_state" 2>/dev/null
   if adg_core_alive; then [ "$applied" != mihomo ]; else [ "$applied" = mihomo ]; fi

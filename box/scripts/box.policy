@@ -5,6 +5,7 @@ scripts_dir="${0%/*}"
 . /data/adb/box/settings.ini
 . "$scripts_dir/apps.utils"
 . "$scripts_dir/adg.utils"
+. "$scripts_dir/dns.utils"
 adg_paths
 policy_pid="$box_run_state/wifi-policy.pid"
 paused_file="$box_run_state/wifi-paused"
@@ -49,7 +50,7 @@ acquire() {
 }
 
 reconcile() {
-  local explicit="${1:-false}" wanted disabled=false running=false paused=false ssid matches=false decision
+  local explicit="${1:-false}" wanted disabled=false running=false paused=false ssid matches=false decision result synced=false
   . /data/adb/box/settings.ini
   wanted=$(cat "$intent_file" 2>/dev/null)
   if [ -z "$wanted" ]; then
@@ -60,7 +61,7 @@ reconcile() {
   live && running=true
   [ ! -f "$paused_file" ] || paused=true
   if [ "$wanted" = running ] && [ "$disabled" = false ]; then
-    ssid=$(mfr_current_ssid) || return 0
+    ssid=$(mfr_current_ssid) || return 75
   else
     ssid=""
   fi
@@ -69,8 +70,8 @@ reconcile() {
   case "$decision" in
     stop|pause)
       if [ "$running" = true ] || { [ "$decision" = pause ] && [ "$paused" = false ]; }; then
-        "$scripts_dir/box.iptables" disable > "$box_run/wifi-policy.log" 2>&1 || return 1
-        "$scripts_dir/box.service" stop >> "$box_run/wifi-policy.log" 2>&1 || return 1
+        "$scripts_dir/box.service" stop > "$box_run/wifi-policy.log" 2>&1 || return 1
+        synced=true
       fi
       if [ "$decision" = pause ]; then
         printf '%s\n' "$ssid" > "$paused_file"
@@ -79,17 +80,22 @@ reconcile() {
       ;;
     start)
       if [ "$running" != true ]; then
-        "$scripts_dir/box.service" restart > "$box_run/wifi-policy.log" 2>&1 || {
-          "$scripts_dir/box.iptables" disable >> "$box_run/wifi-policy.log" 2>&1
-          "$scripts_dir/box.service" stop >> "$box_run/wifi-policy.log" 2>&1
-          return 1
-        }
+        "$scripts_dir/box.service" start > "$box_run/wifi-policy.log" 2>&1
+        result=$?
+        case "$result" in
+          0) ;;
+          77) "$scripts_dir/box.service" describe >/dev/null 2>&1; return 0 ;;
+          *) return "$result" ;;
+        esac
+        synced=true
       fi
       rm -f "$paused_file"
       ;;
   esac
   [ "$wanted" != stopped ] || rm -f "$paused_file"
-  [ ! -f "$scripts_dir/box.adg" ] || MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" sync || return $?
+  if [ "$synced" != true ]; then
+    [ ! -f "$scripts_dir/box.adg" ] || MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" sync || return $?
+  fi
   "$scripts_dir/box.service" describe >/dev/null 2>&1
   return 0
 }
@@ -124,12 +130,35 @@ policy_pending() {
   [ "$wanted" = stopped ] && [ "$paused" = true ]
 }
 
+policy_check() {
+  local current confirmed result
+  policy_transition=false
+  if [ "$(cat "$intent_file" 2>/dev/null)" = stopped ] || [ -f /data/adb/modules/box_for_root/disable ]; then
+    current=''
+  else
+    current=$(mfr_current_ssid) || return 75
+  fi
+  policy_pending "$current" || return 0
+  sleep 1
+  if [ "$(cat "$intent_file" 2>/dev/null)" = stopped ] || [ -f /data/adb/modules/box_for_root/disable ]; then
+    confirmed=''
+  else
+    confirmed=$(mfr_current_ssid) || return 75
+  fi
+  [ "$current" = "$confirmed" ] || return 75
+  acquire || return 75
+  policy_transition=true
+  reconcile false
+  result=$?
+  release
+  return "$result"
+}
+
 trap release EXIT
 trap 'exit 0' INT TERM HUP
 case "$1" in
   start)
     "$scripts_dir/box.http" start >/dev/null 2>&1
-    "$scripts_dir/box.adg" sync >/dev/null 2>&1
     if ! alive "$policy_pid" box.policy; then
       nohup /system/bin/sh "$0" watch </dev/null >/dev/null 2>&1 &
     fi ;;
@@ -141,32 +170,43 @@ case "$1" in
     trap 'release; mfr_events_close; [ "$(cat "$policy_pid" 2>/dev/null)" != "$$" ] || rm -f "$policy_pid"' EXIT
     mfr_events_open policy || exit 1
     next_network=0
+    next_retry=0
+    retries=0
     network_event=true
     next_adg_retry=0
+    last_network=''
     packages_previous=""
     packages_applied=""
     while [ -d /data/adb/modules/box_for_root ]; do
       now=$(mfr_uptime)
-      if [ "$network_event" = true ] || [ "$now" -ge "$next_network" ]; then
+      if [ "$network_event" = true ]; then retries=5; next_retry=$now; fi
+      if [ "$network_event" = true ] || [ "$now" -ge "$next_network" ] ||
+         { [ "$retries" -gt 0 ] && [ "$now" -ge "$next_retry" ]; }; then
         . /data/adb/box/settings.ini
         mfr_events_ensure
         next_network=$((now + $(mfr_network_interval)))
-        "$scripts_dir/box.adg" sync >/dev/null 2>&1
-        current=$(mfr_current_ssid)
-        observed=$?
-        if [ "$observed" = 0 ] && policy_pending "$current"; then
-          sleep 1
-          confirmed=$(mfr_current_ssid)
-          if [ "$?" = 0 ] && [ "$current" = "$confirmed" ] && acquire; then
-            reconcile false
-            release
-          fi
+        # Decisions have priority over AGH work. A short observation window also
+        # covers Android state updates arriving after the last netlink event.
+        policy_check
+        result=$?
+        now=$(mfr_uptime)
+        if { [ "$policy_transition" = true ] && [ "$result" = 0 ]; } ||
+           { [ "$result" != 0 ] && [ "$result" != 75 ]; }; then
+          retries=0
+        elif [ "$retries" -gt 0 ]; then retries=$((retries-1)); fi
+        next_retry=$((now+2))
+        network=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network)
+        if [ "$policy_transition" = true ] && [ "$result" = 0 ]; then
+          last_network="$network"
+        elif [ "$now" -ge "$next_adg_retry" ] &&
+             { [ "$network" != "$last_network" ] || adg_health_needed; }; then
+          "$scripts_dir/box.adg" sync >/dev/null 2>&1
+          if [ "$?" = 0 ]; then last_network="$network"; else next_adg_retry=$((now+30)); fi
         fi
       fi
-      # PID/state checks are cheap; failed AGH recovery is bounded to 30 s.
       if [ "$now" -ge "$next_adg_retry" ] && adg_health_needed; then
         "$scripts_dir/box.adg" sync >/dev/null 2>&1
-        next_adg_retry=$((now + 30))
+        next_adg_retry=$((now+30))
       fi
       # Retain the cheap package-file check; query UIDs only after it changes.
       packages_current=$(stat -c '%i:%Y:%s' "$system_packages_file" 2>/dev/null)
@@ -176,7 +216,9 @@ case "$1" in
       fi
       packages_previous="$packages_current"
       network_event=false
-      mfr_events_wait 5 && network_event=true
+      wait_seconds=5
+      [ "$retries" -le 0 ] || wait_seconds=2
+      mfr_events_wait "$wait_seconds" && network_event=true
     done ;;
   reconcile)
     acquire || exit $?
@@ -202,8 +244,7 @@ case "$1" in
       reconcile true || { echo '启动失败' >&2; exit 1; }
     else
       printf 'stopped\n' > "$intent_file"
-      "$scripts_dir/box.iptables" disable > "$box_run/wifi-policy.log" 2>&1 || exit 1
-      "$scripts_dir/box.service" stop >> "$box_run/wifi-policy.log" 2>&1 || exit 1
+      "$scripts_dir/box.service" stop > "$box_run/wifi-policy.log" 2>&1 || exit 1
       rm -f "$paused_file"
     fi
     if [ "$1" = toggle ]; then

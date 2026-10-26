@@ -1,0 +1,55 @@
+#!/system/bin/sh
+# Observe module-owned capture separately from the core PID and AGH DNS chains.
+mfr_rules_absent() {
+  local tool dump routes family device="${tun_device:-Meta}"
+  for tool in iptables-save ip6tables-save; do
+    dump=$("$tool" 2>/dev/null) || return 1
+    if printf '%s\n' "$dump" | busybox awk -v dev="$device" '
+      /^:(BOX_|DIVERT |LOCAL_IP_V[46] |NAT_DNS_|MIHOMO_DNS_|AP_)/ {found=1}
+      /^-A / && / -j (BOX_|DIVERT |LOCAL_IP_V[46] |NAT_DNS_|MIHOMO_DNS_|AP_)/ {found=1}
+      $1=="-A" && $2=="FORWARD" {
+        for(i=3;i<NF;i++) if(($i=="-i" || $i=="-o") && $(i+1)==dev) found=1
+      }
+      / -p icmp / && / -j DNAT / && /--to-destination 127\.0\.0\.1/ {found=1}
+      END {exit !found}' ; then return 1; fi
+  done
+  for family in -4 -6; do
+    routes=$(ip "$family" rule show 2>/dev/null) || return 1
+    if printf '%s\n' "$routes" | busybox grep -Eq 'fwmark (0x1000000|0x2000000|0x3000000|16777216|33554432|50331648)(/|[[:space:]])'; then return 1; fi
+    routes=$(ip "$family" route show table all 2>/dev/null) || return 1
+    if printf '%s\n' "$routes" | busybox grep -Eq ' table (2024|2025)([[:space:]]|$)'; then return 1; fi
+  done
+  return 0
+}
+
+mfr_rules_mark() {
+  local state="$1" boot
+  boot=$(current_boot_id) || return 1
+  umask 077
+  printf '%s|%s\n' "$boot" "$state" > "$box_run_state/rules.state.next" &&
+    mv "$box_run_state/rules.state.next" "$box_run_state/rules.state"
+}
+
+mfr_rules_disable() {
+  local mode="${1:-all}" began
+  began=$(mfr_millis)
+  [ "${ipv6:-true}" != false ] || ipv6_enable
+  if mfr_rules_absent; then
+    runtime_clear
+    mfr_rules_mark clean
+    mfr_phase_done '接管已撤销，无需清理' "$began"
+    return 0
+  fi
+  mfr_rules_mark dirty || return 1
+  cleanup_iptables_for_mode "$mode"
+  if ! mfr_rules_absent; then
+    # A trusted snapshot describes normal teardown. Unexpected remnants need
+    # recovery across old modes, including an interrupted previous apply.
+    [ "$mode" = all ] || cleanup_iptables_for_mode all
+    mfr_rules_absent || { log Error '接管规则仍有残留，已保留恢复状态。'; return 1; }
+  fi
+  cleanup_cn_ipset_if_needed keep
+  runtime_clear
+  mfr_rules_mark clean || return 1
+  mfr_phase_done '撤销接管' "$began"
+}

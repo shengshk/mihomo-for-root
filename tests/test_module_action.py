@@ -31,7 +31,7 @@ bin_dir="$box_dir/bin"
 box_pid="$box_run/box.pid"
 . "$scripts_dir/network.utils"
 ''')
-        for name in ('network.utils', 'apps.utils', 'adg.utils', 'ports.utils', 'box.policy'):
+        for name in ('network.utils', 'apps.utils', 'adg.utils', 'ports.utils', 'dns.utils', 'box.policy'):
             source = (ROOT/'box/scripts'/name).read_text()
             source = source.replace('/data/adb/modules/box_for_root', str(self.base/'module'))
             source = source.replace('/data/adb/box', str(self.base)).replace('/system/bin/sh', '/bin/bash')
@@ -43,7 +43,7 @@ box_pid="$box_run/box.pid"
         self.write('scripts/box.service', f'''#!/bin/sh
 echo "service $1" >> "{self.base}/operations"
 case "$1" in
- restart) touch "{self.base}/core-running" ;;
+ start) touch "{self.base}/core-running" ;;
  stop) rm -f "{self.base}/core-running" ;;
 esac
 ''')
