@@ -364,8 +364,14 @@ case "$1" in
     "$yq" -r '.chunk' "$request" | busybox base64 -d >> "$manage_dir/uploads/$token.yaml" || fail '上传失败。'
     ok
     ;;
-  settings-save)
+  settings-save|adg-enable)
     lock_operation
+    if [ "$1" = adg-enable ]; then
+      # The help entry only enables AGH using the latest saved settings.
+      # Ignore submitted drafts, DNS overrides and reset requests.
+      if [ "$("$yq" -r '.adguardhome_enabled // false' "$preferences_file")" = true ]; then ok; exit 0; fi
+      "$yq" -o=json '.adguardhome_enabled = true' "$preferences_file" > "$request" || fail '无法读取 AGH 设置。'
+    fi
     adg_reset=false
     if [ "$("$yq" 'has("adg_reset_defaults")' "$request")" = true ]; then
       "$yq" -e '.adg_reset_defaults | tag == "!!bool"' "$request" >/dev/null 2>&1 || fail 'AGH 恢复选项无效。'

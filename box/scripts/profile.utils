@@ -101,6 +101,7 @@ mfr_profile_modes() {
     load(strenv(MFR_SOURCE)) as $source |
     (load(strenv(MFR_TEMPLATE)) * $source) |
     {"tun":(.tun.enable == true),"dns_mode":(.dns."enhanced-mode" // "redir-host"),"ipv6":(.ipv6 == true),
+     "dns_enabled":(.dns.enable == true),"dns_hijack":(.tun."dns-hijack" // []),
      "configured":{"tun":($source.tun // {} | has("enable")),
        "dns_mode":($source.dns // {} | has("enhanced-mode")),"ipv6":($source | has("ipv6"))}}' > "$2"
   local result=$?

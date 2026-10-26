@@ -27,3 +27,5 @@ textarea[wrap=off]{white-space:pre;overflow-wrap:normal;word-break:normal;overfl
 #defaults-yaml{font:12px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;tab-size:2;min-height:320px;max-height:70dvh}
 
 .notice.info{border-left-color:var(--accent)}
+
+#open-dashboard:disabled{cursor:not-allowed}

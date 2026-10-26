@@ -2,19 +2,26 @@
 
 # Only the local manager's WebUI bridge calls this. No command logging or secret files.
 . /data/adb/box/settings.ini
+running=false
+wifi_paused=false
+[ ! -f "$box_run_state/wifi-paused" ] || wifi_paused=true
 
 case "$bin_name" in
   mihomo)
     config="$mihomo_config"
     # Prefer the configuration actually used by a running core.
-    if [ -s "$box_pid" ] && [ -s "$box_dir/mihomo/.box-runtime.yaml" ]; then
+    if [ -s "$box_pid" ]; then
       core_pid=$(cat "$box_pid")
       case "$core_pid" in
         ''|*[!0-9]*) ;;
-        *) if kill -0 "$core_pid" 2>/dev/null; then config="$box_dir/mihomo/.box-runtime.yaml"; fi ;;
+        *) if kill -0 "$core_pid" 2>/dev/null && grep -q '/bin/mihomo' "/proc/$core_pid/cmdline" 2>/dev/null; then
+             running=true
+             [ ! -s "$box_dir/mihomo/.box-runtime.yaml" ] || config="$box_dir/mihomo/.box-runtime.yaml"
+           fi ;;
       esac
     fi
-    expression='{"controller": .["external-controller"], "secret": (.secret // "")}'
+    expression='{"controller": .["external-controller"], "secret": (.secret // ""),
+      "running":(strenv(MFR_RUNNING) == "true"),"wifi_paused":(strenv(MFR_PAUSED) == "true")}'
     ;;
   *)
     printf '%s\n' '当前内核不支持此面板。' >&2
@@ -26,7 +33,7 @@ if [ ! -s "$config" ] || [ ! -x "$bin_dir/yq" ]; then
   printf '%s\n' '未找到内核配置或配置读取工具。' >&2
   exit 1
 fi
-if ! "$bin_dir/yq" -o=json -I=0 "$expression" "$config" 2>/dev/null; then
+if ! MFR_RUNNING="$running" MFR_PAUSED="$wifi_paused" "$bin_dir/yq" -o=json -I=0 "$expression" "$config" 2>/dev/null; then
   printf '%s\n' '配置读取失败，请检查内核配置。' >&2
   exit 1
 fi

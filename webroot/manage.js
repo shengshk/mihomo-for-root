@@ -34,7 +34,12 @@
     const dns=choice("dns-mode") === "follow" ? base.dns_mode : choice("dns-mode");
     const v6=choice("ipv6-mode") === "follow" ? base.ipv6 : choice("ipv6-mode") === "on";
     updateNotice();
-    $("network-summary").textContent=[tun ? "TUN" : "TProxy",dns === "fake-ip" ? "Fake-IP" : "Redir-Host",v6 ? "IPv6" : "IPv4",$("append-dns").checked ? "追加系统 DNS" : ""].filter(Boolean).join(" · ");
+    // This card previews settings, independently of whether the core is paused.
+    const hijackMode=choice("dns-hijack-mode"), entries=base.dns_hijack || [];
+    const yamlCapture=base.dns_enabled && (tun ? entries.length > 0 : entries.some(entry => /^(?:(?:udp|tcp):\/\/)?(?:any|0\.0\.0\.0):53$/.test(entry)));
+    const capture=$("adg-enabled").checked ? "AGH劫持DNS" :
+      (hijackMode === "on" || (hijackMode === "follow" && yamlCapture)) ? "Mihomo劫持DNS" : "不劫持DNS";
+    $("network-summary").textContent=[tun ? "TUN" : "TProxy",dns === "fake-ip" ? "Fake-IP" : "Redir-Host",v6 ? "IPv6" : "IPv4",capture,$("append-dns").checked ? "追加系统 DNS" : ""].filter(Boolean).join(" · ");
     const mode=choice("app-mode");
     const installed=loadedApps && selected[mode] ? applications.filter(app=>selected[mode].has(app.packageName)).length : (state?.app_counts?.[mode] || 0);
     $("apps-summary").textContent=mode === "all" ? "全部代理" : (mode === "include" ? "白名单" : "黑名单") + " · 总数 " + (selected[mode]?.size || 0) + " · 已安装 " + installed;
@@ -86,7 +91,7 @@
       document.querySelectorAll("button:not([data-tab]), input, textarea").forEach(control => {
         control.disabled = controls.get(control) || false;
       });
-      updateAdgControl(); updateDefaultsControl();
+      updateServiceControl(); updateAdgVisibility(); updateAdgControl(); updateDefaultsControl();
       if ($("advanced-settings").open && !defaultsLoaded && !failed) setTimeout(()=>{
         if (!busy && $("advanced-settings").open && !defaultsLoaded) $("advanced-settings").dispatchEvent(new Event("toggle"));
       },0);
@@ -112,6 +117,36 @@
     return (lines.some(line=>line.trim() === hint) ? lines : [hint,...lines]).join("\n");
   }
   const adgLines=id=>$(id).value.split(/\r?\n/).filter(line=>line.trim().length > 0);
+  function updateServiceControl() {
+    $("open-dashboard").disabled = busy || !state?.running;
+  }
+  function renderServiceState(current = state) {
+    $("state").textContent = current.running ? "运行中" : current.wifi_paused ? "代理已暂停" : "已停止";
+    $("state").classList.toggle("on",current.running);
+    $("service-toggle").textContent = current.wifi_paused ? "保持停止" : current.running ? "停止代理" : "启动代理";
+    $("active-name").textContent = current.summary;
+    $("active-name").title = current.summary;
+    updateServiceControl();
+  }
+  function updateAdgVisibility() {
+    // Visibility follows successfully applied preferences, never an unsaved checkbox.
+    const enabled = !!state?.preferences.adguardhome_enabled;
+    $("adg-settings").hidden = !enabled;
+    $("copy-adg").hidden = !enabled;
+    if (!enabled) $("adg-settings").open = false;
+    $("help-summary").textContent = enabled ? "程序使用说明" : "程序使用说明 • AGH隐藏入口";
+    $("help-enable-adg").hidden = !state || enabled;
+    $("help-enable-adg").disabled = busy || !state || enabled;
+  }
+  function renderAdgState() {
+    const adg = state.adguardhome || {};
+    const upstreamNames={system:"系统DNS 作为上游",mihomo:"MihomoDNS 作为上游",pending:"上游待就绪",other:"其他DNS 作为上游",unknown:"上游未知"};
+    const filterNames={enabled:"阻止 IPv6 解析",disabled:"允许 IPv6 解析",unknown:"IPv6 解析状态未知"};
+    $("adg-state").textContent = adg.error || (!state.preferences.adguardhome_enabled ? "未启用" :
+      !adg.running ? "已停止" : adg.api_available === false ? "状态读取失败" :
+      "运行中 · " + (upstreamNames[adg.upstream] || "上游未知") + " · " + (filterNames[adg.aaaa_filter] || "v6状态未知"));
+    updateAdgVisibility();
+  }
   function updateAdgControl() {
     const enabled = $("adg-enabled").checked;
     $("dns-hijack-mode").querySelectorAll("button").forEach(button => button.disabled = busy || enabled);
@@ -161,28 +196,39 @@
     if (!state?.preferences.adguardhome_enabled) { message("请先启用 AdGuard Home。"); return; }
     location.href = "http://127.0.0.1:9092/";
   };
+  $("help-enable-adg").onclick = () => {
+    if (!busy && state && !state.preferences.adguardhome_enabled) $("adg-enable-dialog").showModal();
+  };
+  $("adg-enable-cancel").onclick = () => $("adg-enable-dialog").close();
+  $("adg-enable-confirm").onclick = () => {
+    $("adg-enable-dialog").close();
+    operation("启用 AdGuard Home…", async () => {
+      await MFR.run("adg-enable");
+      const current = await MFR.run("status");
+      if (!current.preferences.adguardhome_enabled) throw new Error("AdGuard Home 未能启用，请重试。");
+      // Keep unrelated settings drafts; this action changes only AGH's enable flag.
+      state.preferences.adguardhome_enabled = true;
+      state.adguardhome = current.adguardhome;
+      state.running = current.running; state.wifi_paused = current.wifi_paused;
+      state.summary = current.summary;
+      $("adg-enabled").checked = true;
+      renderServiceState(); renderAdgState(); updateAdgControl(); updateSummaries();
+      $("adg-settings").open = true;
+    }, {reload:false,done:"AdGuard Home 已启用。"});
+  };
   async function refresh() {
     state = await MFR.run("status");
-    $("state").textContent = state.running ? "运行中" : state.wifi_paused ? "代理已暂停" : "已停止";
-    $("state").classList.toggle("on",state.running);
-    $("service-toggle").textContent = state.wifi_paused ? "保持停止" : state.running ? "停止代理" : "启动代理";
+    renderServiceState();
     $("defaults-summary").textContent = state.defaults_custom ? "自定义兜底" : "内置兜底";
     $("core-version").textContent = state.version;
     setChoice("routing-mode", state.routing_mode || state.preferences.routing_mode || "rule");
-    $("active-name").textContent = state.summary;
-    $("active-name").title = state.summary;
     dnsDirty = false;
     dnsOverrides = structuredClone(state.dns.override);
     renderDns(state.dns.effective);
     $("dns-detected").textContent = state.dns_detected.join("\n") || "未检测到系统 DNS";
     preferences = state.preferences;
     $("adg-enabled").checked = preferences.adguardhome_enabled || false;
-    const adg = state.adguardhome || {};
-    const upstreamNames={system:"系统DNS 作为上游",mihomo:"MihomoDNS 作为上游",pending:"上游待就绪",other:"其他DNS 作为上游",unknown:"上游未知"};
-    const filterNames={enabled:"阻止 IPv6 解析",disabled:"允许 IPv6 解析",unknown:"IPv6 解析状态未知"};
-    $("adg-state").textContent = adg.error || (!preferences.adguardhome_enabled ? "未启用" :
-      !adg.running ? "已停止" : adg.api_available === false ? "状态读取失败" :
-      "运行中 · " + (upstreamNames[adg.upstream] || "上游未知") + " · " + (filterNames[adg.aaaa_filter] || "v6状态未知"));
+    renderAdgState();
     adgResetPending=false;
     $("adg-restore-status").hidden=true;
     const controls=state.adg_controls;
@@ -357,10 +403,6 @@
     }
     $("import-more").hidden=rows.length<=importLimit;
   }
-  function copyAddressMessage(text) {
-    $("copy-address-status").textContent = text;
-    $("copy-address-status").hidden = false;
-  }
   async function copyAddress(text) {
     if (navigator.clipboard?.writeText) {
       try { await navigator.clipboard.writeText(text); return; } catch (_) {}
@@ -376,9 +418,9 @@
     } finally { input.remove(); focused?.focus({preventScroll:true}); }
   }
   document.querySelectorAll("[data-copy-address]").forEach(button=>button.onclick=async()=>{
-    if (!button.dataset.copyAddress) { copyAddressMessage("请重新展开帮助读取地址。"); return; }
-    try { await copyAddress(button.dataset.copyAddress); copyAddressMessage("已复制 " + button.querySelector("span").textContent + " 地址。"); }
-    catch (error) { copyAddressMessage(error.message); }
+    if (!button.dataset.copyAddress) { message("请重新展开帮助读取地址。", true); return; }
+    try { await copyAddress(button.dataset.copyAddress); }
+    catch (error) { message(error.message, true); }
   });
   let helpGeneration=0;
   async function refreshHelpAddress() {
@@ -485,7 +527,16 @@
     syncLogs();
     if (button.dataset.tab === "system" && $("help-settings").open) refreshHelpAddress();
   });
-  $("open-dashboard").onclick=()=>operation("打开面板…",async()=>location.assign(MFR.dashboardUrl(await MFR.connection())),{reload:false});
+  $("open-dashboard").onclick=()=>{
+    if (!state?.running || busy) return;
+    operation("打开面板…",async()=>{
+      const connection = await MFR.connection();
+      state.running = connection.running; state.wifi_paused = connection.wifi_paused;
+      if (!state.running) renderServiceState();
+      if (!state.running) throw new Error("代理未运行。");
+      location.assign(MFR.dashboardUrl(connection));
+    },{reload:false});
+  };
   $("service-toggle").onclick=()=>operation(state.running || state.wifi_paused ?"正在停止代理…":"正在启动代理…",()=>MFR.run(state.running || state.wifi_paused ? "stop":"start"));
   $("core-check").onclick=()=>operation("检查更新…",async()=>{
     const result=await MFR.run("core-check");

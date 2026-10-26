@@ -13,7 +13,7 @@ case "$CONTENT_TYPE" in application/json*) ;; *) reject '415 Unsupported Media T
 case "$CONTENT_LENGTH" in ''|*[!0-9]*) reject '400 Bad Request' '请求长度无效。' ;; esac
 [ "$CONTENT_LENGTH" -le 6291456 ] || reject '413 Content Too Large' '请求过大。'
 action="$QUERY_STRING"
-case "$action" in defaults-get|defaults-save|defaults-restore|logs|status|apps|connection|settings-save|app-list-preview|upload-start|upload-chunk|profile-add|profile-edit|profile-activate|profile-update|profile-delete|panel-update|core-check|core-update|core-rollback|start|stop) ;; *) reject '400 Bad Request' '操作无效。' ;; esac
+case "$action" in defaults-get|defaults-save|defaults-restore|logs|status|apps|connection|settings-save|adg-enable|app-list-preview|upload-start|upload-chunk|profile-add|profile-edit|profile-activate|profile-update|profile-delete|panel-update|core-check|core-update|core-rollback|start|stop) ;; *) reject '400 Bad Request' '操作无效。' ;; esac
 work=$(mktemp -d /data/adb/box/manage/.http.XXXXXXXX) || reject '500 Internal Server Error' '无法创建请求。'
 trap 'rm -rf "$work"' EXIT
 busybox head -c "$CONTENT_LENGTH" > "$work/request.json"
