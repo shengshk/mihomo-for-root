@@ -1,13 +1,50 @@
 #!/system/bin/sh
 # One formatter for the overview and KernelSU/Magisk module description.
+mfr_action_progress() {
+  [ "${MFR_ACTION_PROGRESS:-0}" = 1 ] || return 0
+  # Only fixed stage messages reach the execution screen, never raw logs.
+  { printf '%s\n' "$1" >&3; } 2>/dev/null || true
+}
+mfr_action_error() {
+  if [ "${MFR_ACTION_PROGRESS:-0}" = 1 ]; then mfr_action_progress "$1"
+  else printf '%s\n' "$1" >&2; fi
+}
+mfr_transition_state() {
+  local actor owner state locked
+  [ -r "$box_run_state/service-transition" ] || return 1
+  read -r actor owner state < "$box_run_state/service-transition" 2>/dev/null || return 1
+  case "$actor:$owner" in *[!0-9:]*|:*|*:) return 1 ;; esac
+  case "$state" in starting|stopping|pausing) ;; *) return 1 ;; esac
+  locked=$(cat "$manage_dir/operation.lock/pid" 2>/dev/null)
+  [ "$locked" = "$owner" ] && kill -0 "$actor" 2>/dev/null && kill -0 "$owner" 2>/dev/null || return 1
+  printf '%s\n' "$state"
+}
+mfr_transition_begin() {
+  local state="$1" owner
+  transition_failure=''
+  owner=$(cat "$manage_dir/operation.lock/pid" 2>/dev/null)
+  case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s %s %s\n' "$$" "$owner" "$state" > "$box_run_state/.service-transition.$$" &&
+    mv "$box_run_state/.service-transition.$$" "$box_run_state/service-transition" || return 1
+  mfr_refresh_description "$state"
+}
+mfr_transition_end() {
+  local actor owner state
+  [ -r "$box_run_state/service-transition" ] || return 0
+  read -r actor owner state < "$box_run_state/service-transition" 2>/dev/null || return 0
+  [ "$actor" = "$$" ] || return 0
+  rm -f "$box_run_state/service-transition"
+  mfr_refresh_description "${transition_failure:-}"
+}
 mfr_status_line() {
-  local config="$1" state="$2" routing="$3" values capture mode family configured_route agh
+  local config="$1" state="$2" routing="$3" values capture mode family configured_route agh transition
+  transition=$(mfr_transition_state) && state="$transition"
   values=$("$bin_dir/yq" -r '[.tun.enable // false, .dns."enhanced-mode" // "redir-host", .ipv6 // false, .mode // "rule"] | map(to_string) | join("|")' "$config" 2>/dev/null)
   IFS='|' read -r capture mode family configured_route <<VALUES
 $values
 VALUES
   [ -n "$routing" ] || routing="$configured_route"
-  case "$state" in running) state="运行中" ;; paused) state="已暂停" ;; error) state="启动失败" ;; *) state="已停止" ;; esac
+  case "$state" in running) state="运行中" ;; paused) state="已暂停" ;; starting) state="启动中" ;; stopping) state="停止中" ;; pausing) state="暂停中" ;; error) state="启动失败" ;; stop-error) state="停止失败" ;; pause-error) state="暂停失败" ;; *) state="已停止" ;; esac
   case "$routing" in global) routing="全局" ;; direct) routing="直连" ;; *) routing="规则" ;; esac
   if [ "$capture" = true ]; then capture=TUN; else capture=TProxy; fi
   case "$mode" in fake-ip) mode=Fake-IP ;; redir-host) mode=Redir-Host ;; *) mode=DNS ;; esac

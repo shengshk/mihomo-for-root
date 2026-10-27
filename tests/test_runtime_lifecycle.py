@@ -27,6 +27,7 @@ class RuntimeLifecycleTest(unittest.TestCase):
         self.prefix = f'''box_dir={self.base}; bin_dir=$box_dir/bin; box_run_state=$box_dir
 manage_dir=$box_dir; preferences_file=$box_dir/preferences.json; mfr_dns_port=15353
 log() {{ :; }}
+. {ROOT}/box/scripts/status.utils
 . {ROOT}/box/scripts/config.utils
 . {ROOT}/box/scripts/network.utils
 '''

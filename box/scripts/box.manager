@@ -270,6 +270,7 @@ case "$1" in
     summary_state=stopped
     [ "$paused" != true ] || summary_state=paused
     [ "$live" != true ] || summary_state=running
+    operation_state=$(mfr_transition_state) || operation_state=''
     summary=$(mfr_status_line "$effective_config" "$summary_state" "$effective_routing" "$work/adguardhome.json")
     mfr_write_description "$summary"
     adg_controls_read "$work/adg-controls.json" || fail '无法读取 AGH 快捷设置。'
@@ -279,10 +280,10 @@ case "$1" in
     mfr_profile_dns "$mihomo_config" "$work/profile-dns.json" || fail '无法读取 Mihomo DNS。'
     defaults_custom=false; [ ! -f "$manage_dir/defaults.yaml" ] || defaults_custom=true
     MFR_ADG_DEFAULTS="$work/adg-defaults.json" MFR_DEFAULTS_CUSTOM="$defaults_custom" MFR_ADG_CONTROLS="$work/adg-controls.json" MFR_APP_COUNTS="$work/app-counts.json" MFR_MIHOMO_BASE="$work/mihomo-base.json" MFR_SUMMARY="$summary" MFR_PROFILE_DNS="$work/profile-dns.json" MFR_ADG_JSON="$work/adguardhome.json" \
-    MFR_VERSION="$core_version" MFR_RUNNING="$live" MFR_PREF="$preferences_file" MFR_DB="$db" \
+    MFR_OPERATION_STATE="$operation_state" MFR_VERSION="$core_version" MFR_RUNNING="$live" MFR_PREF="$preferences_file" MFR_DB="$db" \
       MFR_SOURCE="$mihomo_config" MFR_DETECTED="$work/detected.json" MFR_SSID="$ssid" MFR_PAUSED="$paused" \
       MFR_ROUTING_MODE="$effective_routing" MFR_FAKE_IP="$fake_ip" "$yq" -n -o=json '
-      {"running": (strenv(MFR_RUNNING) == "true"), "version": strenv(MFR_VERSION), "summary":strenv(MFR_SUMMARY),
+      {"running": (strenv(MFR_RUNNING) == "true"), "operation_state":strenv(MFR_OPERATION_STATE), "version": strenv(MFR_VERSION), "summary":strenv(MFR_SUMMARY),
        "defaults_custom":(strenv(MFR_DEFAULTS_CUSTOM) == "true"),
        "adg_controls":load(strenv(MFR_ADG_CONTROLS)), "adg_defaults":load(strenv(MFR_ADG_DEFAULTS)),
        "app_counts":load(strenv(MFR_APP_COUNTS)), "mihomo_base":load(strenv(MFR_MIHOMO_BASE)),
@@ -366,6 +367,22 @@ case "$1" in
     ;;
   settings-save|adg-enable)
     lock_operation
+    if [ "$1" = settings-save ] && [ "$("$yq" 'has("section")' "$request")" = true ]; then
+      # Merge only this card into the latest saved preferences under the lock.
+      # Unrelated drafts must never overwrite another card (or another client).
+      section=$("$yq" -r '.section' "$request")
+      case "$section" in
+        mihomo) fields='["tun_mode","dns_mode","ipv6_mode","dns_hijack_mode","append_network_dns","dns_override","dns_profile_id"]' ;;
+        agh) fields='["adguardhome_enabled","adg_controls","adg_reset_defaults"]' ;;
+        apps) fields='["app_mode","include_apps","exclude_apps"]' ;;
+        wifi) fields='["wifi_pause_enabled","wifi_pause_ssids"]' ;;
+        routing) fields='["routing_mode"]' ;;
+        *) fail '设置卡片无效。' ;;
+      esac
+      MFR_FIELDS="$fields" "$yq" -e '(keys - (env(MFR_FIELDS) + ["section"])) | length == 0' "$request" >/dev/null || fail '只能保存当前卡片的设置。'
+      MFR_PREVIOUS="$preferences_file" "$yq" -o=json '({"ipv6_mode":"follow"} * load(strenv(MFR_PREVIOUS))) * (. | del(.section))' "$request" > "$work/section.json" || fail '无法读取已保存设置。'
+      mv "$work/section.json" "$request" || fail '无法准备卡片设置。'
+    fi
     if [ "$1" = adg-enable ]; then
       # The help entry only enables AGH using the latest saved settings.
       # Ignore submitted drafts, DNS overrides and reset requests.

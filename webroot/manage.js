@@ -5,8 +5,11 @@
   let activityId = 0, appsRenderId = 0, importRenderId = 0, appsRequested = false;
   const selected = {include:new Set(),exclude:new Set()};
   let appLimit=100, importLimit=100, importCandidates=[], importSelected=new Set();
-  let dnsOverrides = {}, dnsDirty = false;
+  let dnsOverrides = {};
   let defaultsLoaded = false, defaultsRevision = "", adgResetPending = false;
+  let dnsProfileId = "", defaultsBaseline = "";
+  const savedSections = {};
+  const settingCards = {mihomo:"network-settings",agh:"adg-settings",apps:"apps-settings",wifi:"wifi-settings"};
   const dnsFields = ["nameserver", "fallback", "default-nameserver"];
   const dnsLines = field => [...new Set($("dns-" + field).value.split(/\r?\n/).map(value => value.trim()).filter(Boolean))];
   function message(text, error = false) { $("message").textContent = text; $("message").classList.toggle("error",error); }
@@ -37,7 +40,7 @@
     // This card previews settings, independently of whether the core is paused.
     const hijackMode=choice("dns-hijack-mode"), entries=base.dns_hijack || [];
     const yamlCapture=base.dns_enabled && (tun ? entries.length > 0 : entries.some(entry => /^(?:(?:udp|tcp):\/\/)?(?:any|0\.0\.0\.0):53$/.test(entry)));
-    const capture=$("adg-enabled").checked ? "AGH劫持DNS" :
+    const capture=state?.preferences.adguardhome_enabled ? "AGH劫持DNS" :
       (hijackMode === "on" || (hijackMode === "follow" && yamlCapture)) ? "Mihomo劫持DNS" : "不劫持DNS";
     $("network-summary").textContent=[tun ? "TUN" : "TProxy",dns === "fake-ip" ? "Fake-IP" : "Redir-Host",v6 ? "IPv6" : "IPv4",capture,$("append-dns").checked ? "追加系统 DNS" : ""].filter(Boolean).join(" · ");
     const mode=choice("app-mode");
@@ -45,6 +48,57 @@
     $("apps-summary").textContent=mode === "all" ? "全部代理" : (mode === "include" ? "白名单" : "黑名单") + " · 总数 " + (selected[mode]?.size || 0) + " · 已安装 " + installed;
     $("import-apps").textContent=mode === "include" ? "添加非中国大陆应用清单" : "添加中国大陆应用清单";
     $("wifi-summary").textContent=$("wifi-pause").checked ? "已设置 " + wifiNames().length + " 个" : "未启用";
+    updateDraftControls();
+  }
+  function fingerprint(value) {
+    if (Array.isArray(value)) return "[" + value.map(fingerprint).join(",") + "]";
+    if (value && typeof value === "object") return "{" + Object.keys(value).sort().map(key=>JSON.stringify(key)+":"+fingerprint(value[key])).join(",") + "}";
+    return JSON.stringify(value);
+  }
+  function readSection(section) {
+    switch (section) {
+      case "mihomo": return {tun_mode:choice("tun-mode"),dns_mode:choice("dns-mode"),ipv6_mode:choice("ipv6-mode"),
+        dns_hijack_mode:choice("dns-hijack-mode"),append_network_dns:$("append-dns").checked,
+        dns_profile_id:dnsProfileId,dns_override:structuredClone(dnsOverrides),
+        _dns_values:Object.fromEntries(dnsFields.map(field=>[field,dnsLines(field)]))};
+      case "agh": return {adguardhome_enabled:$("adg-enabled").checked,adg_reset_defaults:adgResetPending,
+        adg_controls:{ipv6_filter:$("adg-ipv6-filter").checked,ipv6_allow:adgLines("adg-ipv6-allow"),
+          adblock:$("adg-adblock").checked,filter_urls:adgLines("adg-filter-urls")}};
+      case "apps": return {app_mode:choice("app-mode"),include_apps:[...selected.include].sort(),exclude_apps:[...selected.exclude].sort()};
+      case "wifi": return {wifi_pause_enabled:$("wifi-pause").checked,wifi_pause_ssids:wifiNames().sort()};
+    }
+  }
+  function restoreSection(section, draft) {
+    switch (section) {
+      case "mihomo":
+        for (const [id,key] of [["tun-mode","tun_mode"],["dns-mode","dns_mode"],["ipv6-mode","ipv6_mode"],["dns-hijack-mode","dns_hijack_mode"]]) setChoice(id,draft[key]);
+        $("append-dns").checked=draft.append_network_dns;
+        dnsProfileId=draft.dns_profile_id; dnsOverrides=structuredClone(draft.dns_override);
+        renderDns(draft._dns_values); break;
+      case "agh":
+        $("adg-enabled").checked=draft.adguardhome_enabled;
+        $("adg-ipv6-filter").checked=draft.adg_controls.ipv6_filter;
+        $("adg-ipv6-allow").value=draft.adg_controls.ipv6_allow.join("\n");
+        $("adg-adblock").checked=draft.adg_controls.adblock;
+        $("adg-filter-urls").value=draft.adg_controls.filter_urls.join("\n");
+        adgResetPending=draft.adg_reset_defaults; $("adg-restore-status").hidden=!adgResetPending; break;
+      case "apps":
+        setChoice("app-mode",draft.app_mode); selected.include=new Set(draft.include_apps); selected.exclude=new Set(draft.exclude_apps); break;
+      case "wifi": $("wifi-pause").checked=draft.wifi_pause_enabled; $("wifi-ssids").value=draft.wifi_pause_ssids.join("\n"); break;
+    }
+  }
+  function sectionDirty(section) {
+    return savedSections[section] !== undefined && fingerprint(readSection(section)) !== savedSections[section];
+  }
+  function markDirty(card, badge, button, dirty) {
+    $(card).classList.toggle("is-dirty",dirty);
+    $(badge).hidden=!dirty;
+    $(button).hidden=!dirty;
+    $(button).disabled=busy || !dirty;
+  }
+  function updateDraftControls() {
+    for (const [section,card] of Object.entries(settingCards)) markDirty(card,section+"-dirty","save-"+section,sectionDirty(section));
+    markDirty("advanced-settings","advanced-dirty","defaults-save",defaultsLoaded && $("defaults-yaml").value !== defaultsBaseline);
   }
   function node(tag, text, className) {
     const element = document.createElement(tag);
@@ -91,7 +145,7 @@
       document.querySelectorAll("button:not([data-tab]), input, textarea").forEach(control => {
         control.disabled = controls.get(control) || false;
       });
-      updateServiceControl(); updateAdgVisibility(); updateAdgControl(); updateDefaultsControl();
+      updateServiceControl(); updateAdgVisibility(); updateAdgControl(); updateDefaultsControl(); updateDraftControls();
       if ($("advanced-settings").open && !defaultsLoaded && !failed) setTimeout(()=>{
         if (!busy && $("advanced-settings").open && !defaultsLoaded) $("advanced-settings").dispatchEvent(new Event("toggle"));
       },0);
@@ -118,10 +172,17 @@
   }
   const adgLines=id=>$(id).value.split(/\r?\n/).filter(line=>line.trim().length > 0);
   function updateServiceControl() {
-    $("open-dashboard").disabled = busy || !state?.running;
+    const transitioning = !!state?.operation_state;
+    $("open-dashboard").disabled = busy || transitioning || !state?.running;
+    $("service-toggle").disabled = busy || transitioning || !state;
+    const adgEnabled = !!state?.preferences.adguardhome_enabled;
+    $("open-adg").hidden = !adgEnabled;
+    $("open-adg").disabled = busy || !adgEnabled;
+    $("service-toggle").hidden = adgEnabled;
   }
   function renderServiceState(current = state) {
-    $("state").textContent = current.running ? "运行中" : current.wifi_paused ? "代理已暂停" : "已停止";
+    $("state").textContent = ({starting:"启动中",stopping:"停止中",pausing:"暂停中"})[current.operation_state] ||
+      (current.running ? "运行中" : current.wifi_paused ? "代理已暂停" : "已停止");
     $("state").classList.toggle("on",current.running);
     $("service-toggle").textContent = current.wifi_paused ? "保持停止" : current.running ? "停止代理" : "启动代理";
     $("active-name").textContent = current.summary;
@@ -149,10 +210,11 @@
   }
   function updateAdgControl() {
     const enabled = $("adg-enabled").checked;
-    $("dns-hijack-mode").querySelectorAll("button").forEach(button => button.disabled = busy || enabled);
-    $("dns-hijack-mode").hidden = enabled;
-    $("dns-hijack-label").textContent = enabled ? "DNS 劫持：关闭 · AGH 接管" : "DNS 劫持";
-    $("dns-hijack-help").hidden = enabled;
+    const capture = !!state?.preferences.adguardhome_enabled;
+    $("dns-hijack-mode").querySelectorAll("button").forEach(button => button.disabled = busy || capture);
+    $("dns-hijack-mode").hidden = capture;
+    $("dns-hijack-label").textContent = capture ? "DNS 劫持：关闭 · AGH 接管" : "DNS 劫持";
+    $("dns-hijack-help").hidden = capture;
     $("adg-shortcuts").disabled = busy || !enabled;
     $("adg-ipv6-allow").disabled = busy || !enabled || !$("adg-ipv6-filter").checked;
     $("adg-ipv6-field").hidden = !$("adg-ipv6-filter").checked;
@@ -163,15 +225,14 @@
     for (const field of dnsFields) $("dns-" + field).value = (values[field] || []).join("\n");
   }
   for (const field of dnsFields) $("dns-" + field).addEventListener("input", () => {
-    dnsDirty = true;
     const values = dnsLines(field);
     if (JSON.stringify(values) === JSON.stringify(state.dns.base[field])) delete dnsOverrides[field];
     else dnsOverrides[field] = values;
   });
   $("dns-restore").onclick = () => {
-    dnsDirty = true;
     dnsOverrides = {};
     renderDns(state.dns.base);
+    updateDraftControls();
     message("已恢复配置值，保存后生效。");
   };
   $("adg-enabled").onchange = () => { updateAdgControl(); updateSummaries(); };
@@ -190,10 +251,11 @@
     adgResetPending=true;
     $("adg-restore-status").hidden=false;
     updateAdgControl();
+    updateDraftControls();
     message("已恢复默认配置，保存后生效。");
   };
   $("open-adg").onclick = () => {
-    if (!state?.preferences.adguardhome_enabled) { message("请先启用 AdGuard Home。"); return; }
+    if (busy || !state?.preferences.adguardhome_enabled) return;
     location.href = "http://127.0.0.1:9092/";
   };
   $("help-enable-adg").onclick = () => {
@@ -206,24 +268,20 @@
       await MFR.run("adg-enable");
       const current = await MFR.run("status");
       if (!current.preferences.adguardhome_enabled) throw new Error("AdGuard Home 未能启用，请重试。");
-      // Keep unrelated settings drafts; this action changes only AGH's enable flag.
-      state.preferences.adguardhome_enabled = true;
-      state.adguardhome = current.adguardhome;
-      state.running = current.running; state.wifi_paused = current.wifi_paused;
-      state.summary = current.summary;
-      $("adg-enabled").checked = true;
-      renderServiceState(); renderAdgState(); updateAdgControl(); updateSummaries();
+      await refresh({savedSection:"agh"});
       $("adg-settings").open = true;
     }, {reload:false,done:"AdGuard Home 已启用。"});
   };
-  async function refresh() {
+  async function refresh({savedSection=""} = {}) {
+    const drafts={};
+    for (const section of Object.keys(settingCards)) if (section !== savedSection && sectionDirty(section)) drafts[section]=readSection(section);
     state = await MFR.run("status");
     renderServiceState();
     $("defaults-summary").textContent = state.defaults_custom ? "自定义兜底" : "内置兜底";
     $("core-version").textContent = state.version;
     setChoice("routing-mode", state.routing_mode || state.preferences.routing_mode || "rule");
-    dnsDirty = false;
     dnsOverrides = structuredClone(state.dns.override);
+    dnsProfileId = state.configs.active;
     renderDns(state.dns.effective);
     $("dns-detected").textContent = state.dns_detected.join("\n") || "未检测到系统 DNS";
     preferences = state.preferences;
@@ -248,6 +306,9 @@
     setChoice("app-mode", preferences.app_mode);
     selected.include = new Set(preferences.include_apps);
     selected.exclude = new Set(preferences.exclude_apps);
+    for (const section of Object.keys(settingCards)) savedSections[section]=fingerprint(readSection(section));
+    for (const [section,draft] of Object.entries(drafts)) restoreSection(section,draft);
+    updateAdgControl();
     updateSummaries();
     renderProfiles(); await updateAppPicker();
     if ($("help-settings").open) await refreshHelpAddress();
@@ -442,10 +503,12 @@
   }
   $("help-settings").addEventListener("toggle",refreshHelpAddress);
   function updateDefaultsControl() {
-    for (const id of ["defaults-yaml","defaults-save","defaults-restore"]) $(id).disabled=busy || !defaultsLoaded;
+    for (const id of ["defaults-yaml","defaults-restore"]) $(id).disabled=busy || !defaultsLoaded;
+    updateDraftControls();
   }
   function showDefaults(result) {
     $("defaults-yaml").value=result.yaml;
+    defaultsBaseline=result.yaml;
     defaultsRevision=result.revision; defaultsLoaded=true;
     $("defaults-summary").textContent=result.custom ? "自定义兜底" : "内置兜底";
     $("defaults-status").textContent=result.custom ? "自定义内容升级后保留。" : "正在使用内置兜底。";
@@ -453,16 +516,11 @@
   }
   async function refreshAfterDefaults() {
     // Refresh effective values without discarding drafts in the other cards.
-    state=await MFR.run("status"); preferences=state.preferences;
-    $("state").textContent=state.running ? "运行中" : state.wifi_paused ? "代理已暂停" : "已停止";
-    $("state").classList.toggle("on",state.running);
-    $("service-toggle").textContent=state.wifi_paused ? "保持停止" : state.running ? "停止代理" : "启动代理";
-    $("active-name").textContent=state.summary; $("active-name").title=state.summary;
-    if (!dnsDirty) renderDns(state.dns.effective);
-    updateSummaries();
+    await refresh();
   }
   $("defaults-yaml").addEventListener("input",()=>{
-    $("defaults-status").textContent="尚未保存。";
+    $("defaults-status").textContent=$("defaults-yaml").value === defaultsBaseline ? "与已加载内容一致。" : "尚未保存。";
+    updateDraftControls();
   });
   $("advanced-settings").addEventListener("toggle",()=>{
     if (!$("advanced-settings").open || defaultsLoaded || busy) return;
@@ -470,7 +528,7 @@
   });
   $("defaults-form").onsubmit=event=>{
     event.preventDefault();
-    if (!defaultsLoaded) return;
+    if (!defaultsLoaded || $("defaults-yaml").value === defaultsBaseline) return;
     const payload={yaml:$("defaults-yaml").value,revision:defaultsRevision};
     operation("检查并应用兜底…",async()=>{
       showDefaults(await MFR.run("defaults-save",payload));
@@ -537,7 +595,10 @@
       location.assign(MFR.dashboardUrl(connection));
     },{reload:false});
   };
-  $("service-toggle").onclick=()=>operation(state.running || state.wifi_paused ?"正在停止代理…":"正在启动代理…",()=>MFR.run(state.running || state.wifi_paused ? "stop":"start"));
+  $("service-toggle").onclick=()=>{
+    if (!state || state.operation_state) return;
+    operation(state.running || state.wifi_paused ?"正在停止代理…":"正在启动代理…",()=>MFR.run(state.running || state.wifi_paused ? "stop":"start"));
+  };
   $("core-check").onclick=()=>operation("检查更新…",async()=>{
     const result=await MFR.run("core-check");
     $("latest-version").textContent="官方稳定版："+result.latest+(state.version.includes(result.latest)?"，当前已是此版本。":"，可点击更新。");
@@ -546,6 +607,18 @@
   $("core-rollback").onclick=()=>{if(confirm("恢复上一版本内核？"))operation("正在检查并恢复上一版本…",()=>MFR.run("core-rollback"));};
   document.querySelectorAll(".choices").forEach(group => group.querySelectorAll("[data-value]").forEach(button => {
     button.onclick = () => {
+      if (busy) return;
+      if (group.id === "routing-mode") {
+        const previous=choice(group.id), next=button.dataset.value;
+        if (!state || previous === next) return;
+        setChoice(group.id,next);
+        operation("切换运行模式…",async()=>{
+          try { await MFR.run("settings-save",{section:"routing",routing_mode:next}); }
+          catch (error) { setChoice(group.id,previous); throw error; }
+          await refresh();
+        },{reload:false,done:"运行模式已应用。"});
+        return;
+      }
       setChoice(group.id, button.dataset.value);
       if (group.id === "log-type") { syncLogs(); return; }
       updateSummaries();
@@ -614,15 +687,22 @@
       if($("apps-settings").open&&choice("app-mode")!=="all") operation("加载应用…",async()=>{await loadApps();await renderApps();},{reload:false,done:"应用已加载。"});
     }
   });
-  $("settings-form").onsubmit=event=>{
-    event.preventDefault();
-    const payload={tun_mode:choice("tun-mode"),dns_mode:choice("dns-mode"),adguardhome_enabled:$("adg-enabled").checked,routing_mode:choice("routing-mode"),ipv6_mode:choice("ipv6-mode"),dns_hijack_mode:choice("dns-hijack-mode"),wifi_pause_enabled:$("wifi-pause").checked,wifi_pause_ssids:wifiNames(),append_network_dns:$("append-dns").checked,app_mode:choice("app-mode"),include_apps:[...selected.include],exclude_apps:[...selected.exclude]};
-    payload.adg_reset_defaults=adgResetPending;
-    payload.adg_controls={ipv6_filter:$("adg-ipv6-filter").checked,ipv6_allow:adgLines("adg-ipv6-allow"),adblock:$("adg-adblock").checked,filter_urls:adgLines("adg-filter-urls")};
-    payload.dns_profile_id = state.configs.active;
-    payload.dns_override = dnsOverrides;
-    operation("保存中…",()=>MFR.run("settings-save",payload));
-  };
+  // Drafts live only in this document: reloading discards them, folding does not.
+  $("settings-form").addEventListener("input",updateDraftControls);
+  $("settings-form").addEventListener("change",updateDraftControls);
+  document.querySelectorAll("[data-save-section]").forEach(button=>{
+    button.onclick=()=>{
+      const section=button.dataset.saveSection;
+      if (busy || !sectionDirty(section)) return;
+      const payload={section,...readSection(section)};
+      delete payload._dns_values;
+      if (![...$(settingCards[section]).querySelectorAll("input, textarea")].every(control=>control.disabled || control.reportValidity())) return;
+      operation("保存并应用…",async()=>{
+        await MFR.run("settings-save",payload);
+        await refresh({savedSection:section});
+      },{reload:false,done:"已保存并应用。"});
+    };
+  });
   $("add-profile").onsubmit=event=>{
     event.preventDefault();
     operation("检查配置…",async()=>{

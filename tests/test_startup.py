@@ -52,6 +52,7 @@ box_dns_runtime="$box_dir/mihomo/runtime.yaml"
 bin_log="$box_dir/run/mihomo.log"
 box_user_group=0:0
 adguardhome_enabled=true
+. "{ROOT}/box/scripts/status.utils"
 . "$scripts_dir/adg.utils"
 . "$scripts_dir/config.utils"
 . "$scripts_dir/network.utils"

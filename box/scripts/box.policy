@@ -6,6 +6,7 @@ scripts_dir="${0%/*}"
 . "$scripts_dir/apps.utils"
 . "$scripts_dir/adg.utils"
 . "$scripts_dir/dns.utils"
+. "$scripts_dir/status.utils"
 adg_paths
 policy_pid="$box_run_state/wifi-policy.pid"
 paused_file="$box_run_state/wifi-paused"
@@ -21,6 +22,7 @@ alive() {
 live() { alive "$box_pid" /bin/mihomo; }
 
 release() {
+  mfr_transition_end
   if [ "${policy_lock:-false}" = true ]; then
     rm -f "$manage_dir/operation.lock/pid"
     rmdir "$manage_dir/operation.lock" 2>/dev/null
@@ -70,7 +72,14 @@ reconcile() {
   case "$decision" in
     stop|pause)
       if [ "$running" = true ] || { [ "$decision" = pause ] && [ "$paused" = false ]; }; then
-        "$scripts_dir/box.service" stop > "$box_run/wifi-policy.log" 2>&1 || return 1
+        if [ "$decision" = pause ]; then
+          mfr_transition_begin pausing || return 1
+          mfr_action_progress '指定 Wi-Fi，正在暂停代理…'
+        else mfr_transition_begin stopping || return 1; fi
+        "$scripts_dir/box.service" stop > "$box_run/wifi-policy.log" 2>&1 || {
+          if [ "$decision" = pause ]; then transition_failure=pause-error; else transition_failure=stop-error; fi
+          return 1
+        }
         synced=true
       fi
       if [ "$decision" = pause ]; then
@@ -80,12 +89,14 @@ reconcile() {
       ;;
     start)
       if [ "$running" != true ]; then
+        mfr_transition_begin starting || return 1
+        mfr_action_progress '正在启动 Mihomo…'
         "$scripts_dir/box.service" start > "$box_run/wifi-policy.log" 2>&1
         result=$?
         case "$result" in
           0) ;;
           77) "$scripts_dir/box.service" describe >/dev/null 2>&1; return 0 ;;
-          *) return "$result" ;;
+          *) transition_failure=error; return "$result" ;;
         esac
         synced=true
       fi
@@ -225,33 +236,43 @@ case "$1" in
     reconcile "${2:-false}" ;;
   request-start|request-stop|toggle)
     request="$1"
-    # Check the current network, not the watcher's possibly stale pause flag.
-    # A skipped Action must leave intent, DNS watching and pause state alone.
     if [ "$request" = toggle ]; then
-      ssid=$(mfr_current_ssid) || { echo '无法读取 Wi-Fi 状态' >&2; exit 1; }
-      if mfr_wifi_matches "$ssid"; then echo '当前 Wi-Fi 下暂停代理'; exit 0; fi
+      exec 3>&1
+      export MFR_ACTION_PROGRESS=1
     fi
-    acquire || { echo '操作进行中' >&2; exit 1; }
+    # Reject unknown network state before changing the user's intent.
+    if [ "$request" = toggle ]; then
+      ssid=$(mfr_current_ssid) || { mfr_action_error '无法读取 Wi-Fi 状态'; exit 1; }
+    fi
+    acquire || { mfr_action_error '操作进行中，请勿重复执行。'; exit 1; }
     if [ "$request" = toggle ]; then
       . /data/adb/box/settings.ini
-      [ ! -f /data/adb/modules/box_for_root/disable ] || { echo '模块未启用' >&2; exit 1; }
-      ssid=$(mfr_current_ssid) || { echo '无法读取 Wi-Fi 状态' >&2; exit 1; }
-      if mfr_wifi_matches "$ssid"; then echo '当前 Wi-Fi 下暂停代理'; exit 0; fi
-      if live; then request=request-stop; else request=request-start; fi
+      [ ! -f /data/adb/modules/box_for_root/disable ] || { mfr_action_error '模块未启用'; exit 1; }
+      ssid=$(mfr_current_ssid) || { mfr_action_error '无法读取 Wi-Fi 状态'; exit 1; }
+      # A paused core still has running intent. Toggle that intent, then let
+      # reconcile enforce Wi-Fi policy instead of forcing the core to start.
+      wanted=$(cat "$intent_file" 2>/dev/null)
+      case "$wanted" in
+        running|stopped) ;;
+        *) if live; then wanted=running; else wanted=stopped; fi ;;
+      esac
+      if [ "$wanted" = running ]; then request=request-stop; else request=request-start; fi
     fi
     if [ "$request" = request-start ]; then
       printf 'running\n' > "$intent_file"
-      reconcile true || { echo '启动失败' >&2; exit 1; }
+      reconcile true || { mfr_action_error '启用失败，请查看模块日志。'; exit 1; }
     else
+      mfr_transition_begin stopping || exit 1
+      mfr_action_progress '正在停止代理…'
       printf 'stopped\n' > "$intent_file"
-      "$scripts_dir/box.service" stop > "$box_run/wifi-policy.log" 2>&1 || exit 1
+      "$scripts_dir/box.service" stop > "$box_run/wifi-policy.log" 2>&1 || { transition_failure=stop-error; mfr_action_error '停止失败，请查看模块日志。'; exit 1; }
       rm -f "$paused_file"
     fi
     if [ "$1" = toggle ]; then
-      if [ "$request" = request-stop ]; then echo '已停止'
-      elif live; then echo '已启动'
-      elif [ -f "$paused_file" ]; then echo '当前 Wi-Fi 下暂停代理'
-      else echo '启动失败' >&2; exit 1
+      if [ "$request" = request-stop ]; then echo '停止完成'
+      elif live; then echo '启动完成'
+      elif [ -f "$paused_file" ]; then echo '已暂停，离开指定 Wi-Fi 后恢复。'
+      else mfr_action_error '启动失败'; exit 1
       fi
     fi ;;
   boot)

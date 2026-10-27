@@ -393,16 +393,21 @@ box_run_bin() {
   local phase result
   mfr_start_gate || return $?
   phase=$(mfr_millis)
+  mfr_action_progress '正在检查配置…'
   prepare_mihomo_runtime || {
+    mfr_action_progress '✗ 配置检查失败，请查看模块日志。'
     log Error 'Mihomo 配置检查失败，详见 network-dns-check.log。'
     return 1
   }
   mfr_phase_done '准备与校验配置' "$phase"
+  mfr_action_progress '✓ 配置检查通过'
   mfr_start_gate || return $?
   if [ "${adguardhome_enabled:-false}" = true ] && [ -f "$scripts_dir/box.adg" ]; then
+    mfr_action_progress '正在准备 AGH 系统 DNS…'
     # Preparation can span a network handoff. Refresh the current system DNS
     # before creating the new PID; an initializing core must not receive AGH yet.
     startup_adg_step before-stop || {
+      mfr_action_progress '✗ AGH 系统 DNS 准备失败'
       log Error '启动前更新 AGH 系统 DNS 失败。'
       return 1
     }
@@ -412,19 +417,26 @@ box_run_bin() {
   printf '%s' "$PID" > "$box_pid"
   phase=$(mfr_millis)
   if [ "${adguardhome_enabled:-false}" = true ] || [ "$("$box_dns_yq" -r '.dns.enable' "$box_dns_runtime" 2>/dev/null)" = true ]; then
-    wait_mihomo_dns "$PID" || return $?
+    mfr_action_progress '等待核心 DNS 就绪…'
+    wait_mihomo_dns "$PID"
+    result=$?
+    [ "$result" -eq 0 ] || { mfr_action_progress '✗ 核心 DNS 未就绪，请查看 Mihomo 日志。'; return "$result"; }
   else
     sleep 1
     kill -0 "$PID" 2>/dev/null || { log Error 'Mihomo 启动期间退出，详见 mihomo.log。'; return 1; }
   fi
   mfr_phase_done '核心就绪' "$phase"
+  mfr_action_progress '✓ 核心已就绪'
   mfr_start_gate || return $?
   phase=$(mfr_millis)
   if [ -f "$scripts_dir/box.adg" ]; then
+    [ "${adguardhome_enabled:-false}" != true ] || mfr_action_progress '正在切换 AGH 上游…'
     startup_adg_step sync || {
+      mfr_action_progress '✗ DNS 上游切换失败'
       log Error 'AGH 切换至 Mihomo DNS 失败。'
       return 1
     }
+    [ "${adguardhome_enabled:-false}" != true ] || mfr_action_progress '✓ AGH 上游已切换'
   fi
   mfr_start_gate || return $?
   mfr_phase_done 'DNS 上游切换' "$phase"
@@ -465,12 +477,14 @@ start_box() {
     return "$result"
   fi
   phase=$(mfr_millis)
-  "$scripts_dir/box.iptables" renew || { stop_box; return 1; }
+  mfr_action_progress '正在启用流量接管…'
+  "$scripts_dir/box.iptables" renew || { mfr_action_progress '✗ 流量接管失败'; stop_box; return 1; }
   # A handoff can also occur while installing capture rules.
   mfr_start_gate
   result=$?
   if [ "$result" -ne 0 ]; then stop_box; return "$result"; fi
   mfr_phase_done '恢复接管' "$phase"
+  mfr_action_progress '✓ 流量接管已启用'
   set_description running
   log Info "Mihomo 已启动"
 }
@@ -478,8 +492,12 @@ start_box() {
 stop_box() {
   local phase
   phase=$(mfr_millis)
-  "$scripts_dir/box.iptables" disable || return 1
-  [ ! -f "$scripts_dir/box.adg" ] || startup_adg_step before-stop || { log Error 'AGH 上游切换失败，暂不停止核心。'; return 1; }
+  mfr_action_progress '正在撤销流量接管…'
+  "$scripts_dir/box.iptables" disable || { mfr_action_progress '✗ 撤销流量接管失败'; return 1; }
+  mfr_action_progress '✓ 流量接管已撤销'
+  [ "${adguardhome_enabled:-false}" != true ] || mfr_action_progress '正在将 AGH 切回系统 DNS…'
+  [ ! -f "$scripts_dir/box.adg" ] || startup_adg_step before-stop || { mfr_action_progress '✗ AGH 上游切换失败，暂不停止核心。'; log Error 'AGH 上游切换失败，暂不停止核心。'; return 1; }
+  [ "${adguardhome_enabled:-false}" != true ] || mfr_action_progress '✓ AGH 已使用系统 DNS'
   "${scripts_dir}/box.dns" stop >/dev/null 2>&1
   local process
   process=$(cat "$box_pid" 2>/dev/null)
@@ -487,6 +505,7 @@ stop_box() {
     ''|*[!0-9]*) ;;
     *)
       if kill -0 "$process" 2>/dev/null && grep -q '/bin/mihomo' "/proc/$process/cmdline" 2>/dev/null; then
+        mfr_action_progress '正在停止核心…'
         kill -15 "$process" 2>/dev/null
         local count=0
         while kill -0 "$process" 2>/dev/null && [ "$count" -lt 5 ]; do
