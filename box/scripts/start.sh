@@ -74,7 +74,7 @@ start_inotifyd() {
 mkdir -p /data/adb/box/run/ /data/adb/box/run/state/ >/dev/null 2>&1 || true
 "${scripts_dir}/box.http" start >/dev/null 2>&1
 "${scripts_dir}/box.cron" sync >/dev/null 2>&1
-"${scripts_dir}/box.adg" sync >/dev/null 2>&1
+"${scripts_dir}/box.policy" adg-sync >/dev/null 2>&1
 if [ -f "/data/adb/box/manual" ]; then
   if [ -f "/data/adb/box/run/box.pid" ]; then
       rm /data/adb/box/run/box.pid

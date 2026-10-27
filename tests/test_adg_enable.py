@@ -30,6 +30,14 @@ printf 'sync\\n' >> "{self.fx.base}/adg-calls"
         self.assertEqual(json.loads(self.pref.read_text()), {**self.before,'adguardhome_enabled':True})
         self.assertEqual(self.db.read_bytes(), self.db_before)
 
+    def test_manual_enable_clears_circuit_notice(self):
+        notice=self.fx.base/'manage/adguardhome-disabled'
+        notice.write_text('AGH 连续切换失败，已停用；可在帮助中重新启用。')
+        self.assertIn('已停用',self.fx.call('status')['adguardhome']['error'])
+        self.fx.call('adg-enable')
+        self.assertFalse(notice.exists())
+        self.assertTrue(json.loads(self.pref.read_text())['adguardhome_enabled'])
+
     def test_already_enabled_does_not_reapply(self):
         self.fx.call('adg-enable')
         calls = (self.fx.base/'adg-calls').read_bytes()

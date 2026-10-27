@@ -130,7 +130,7 @@ mfr_start_gate
 
     def test_network_state_lag_and_lock_busy_retry_without_waiting_sixty_seconds(self):
         source=(ROOT/'box/scripts/box.policy').read_text()
-        watch=source.split('  watch)\n',1)[1].split('  reconcile)\n',1)[0].rsplit(';;',1)[0]
+        watch=source.split('  watch)\n',1)[1].split('  adg-sync)\n',1)[0].rsplit(';;',1)[0]
         funcs=functions(ROOT/'box/scripts/box.policy',['policy_pending','policy_check'])
         (self.base/'scripts').mkdir();(self.base/'scripts/network.events').write_text('')
         (self.base/'settings').write_text('')
@@ -138,7 +138,7 @@ mfr_start_gate
         (self.base/'service-intent').write_text('running\n');(self.base/'wifi-paused').write_text('Home\n')
         code=f'''scripts_dir=$box_dir/scripts;policy_pid=$box_dir/pid;intent_file=$box_dir/service-intent
 paused_file=$box_dir/wifi-paused;system_packages_file=$box_dir/none
-alive() {{ return 1; }};live() {{ return 1; }};release() {{ :; }};adg_health_needed() {{ return 1; }}
+alive() {{ return 1; }};live() {{ return 1; }};release() {{ :; }};sync_adg_policy() {{ :; }};adg_health_needed() {{ return 1; }}
 mfr_events_open() {{ :; }};mfr_events_ensure() {{ :; }};mfr_events_close() {{ :; }}
 mfr_uptime() {{ cat "$box_dir/clock"; }};mfr_network_interval() {{ echo 60; }}
 sleep() {{ echo $(($(cat "$box_dir/clock")+$1)) > "$box_dir/clock"; }}

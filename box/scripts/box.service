@@ -373,8 +373,11 @@ startup_adg_step() {
       return 1
     fi
     result=0
-    MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" "$phase" || result=$?
+    adg_sync "$phase" || result=$?
     if [ "$result" -eq 0 ]; then
+      if [ -s "${preferences_file:-}" ]; then
+        adguardhome_enabled=$("$bin_dir/yq" -r '.adguardhome_enabled // false' "$preferences_file")
+      fi
       [ "$attempt" -eq 1 ] || adg_diagnostic "startup phase=$phase recovered attempt=$attempt"
       return 0
     fi
@@ -382,10 +385,28 @@ startup_adg_step() {
     [ "$result" -ne 75 ] || reason='操作锁占用'
     adg_diagnostic "startup phase=$phase attempt=$attempt/3 exit=$result ${reason:-未知错误}"
     log Warning "AGH ${phase} 失败（${attempt}/3，退出码 ${result}）。"
+    # Actual daemon failures already had one bounded recovery inside box.adg.
+    # Only lock contention may be retried here; do not multiply API timeouts.
+    [ "$result" -eq 75 ] || return "$result"
     [ "$attempt" -lt 3 ] || return "$result"
     sleep 1
     attempt=$((attempt+1))
   done
+}
+
+recover_adg_dns() {
+  [ -f "$manage_dir/adguardhome-recovery-pending" ] || return 0
+  # A managed stop will kill the core next. Keep the pending marker until the
+  # subsequent sync; do not reload a core just to stop it.
+  if [ "$1" = before-stop ] && adg_core_alive; then return 0; fi
+  if adg_core_alive; then
+    reload_mihomo && "$scripts_dir/box.iptables" renew || return 1
+  else
+    prepare_mihomo_runtime || return 1
+  fi
+  rm -f "$manage_dir/adguardhome-recovery-pending"
+  adg_diagnostic 'circuit DNS restoration complete; AGH remains disabled'
+  mfr_action_progress 'AGH 切换失败，已停用并恢复原 DNS 设置。'
 }
 
 box_run_bin() {
@@ -532,6 +553,7 @@ case "$1" in
     start_box; exit $?
     ;;
   reload) reload_mihomo ;;
+  adg-recover) recover_adg_dns "${2:-sync}" ;;
   validate)
     MFR_SOURCE_CONFIG="$2"
     MFR_CHECK_ONLY=1

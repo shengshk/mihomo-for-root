@@ -121,9 +121,11 @@ box_run="$box_dir/run"
 box_run_state="$box_run/state"
 box_pid="$box_run/box.pid"
 manage_dir="$box_dir/manage"
-adguardhome_enabled=true
+preferences_file="$manage_dir/preferences.json"
+adguardhome_enabled=$("$bin_dir/yq" -r '.adguardhome_enabled // false' "$preferences_file")
 [ ! -f "$box_dir/disabled" ] || adguardhome_enabled=false
 ''')
+        (self.base/'manage/preferences.json').write_text(json.dumps({'adguardhome_enabled':True}))
         self.spawn('system-dns', self.system, '203.0.113.7')
         self.addCleanup(self.close)
 
@@ -133,7 +135,7 @@ adguardhome_enabled=true
         p=subprocess.Popen(['python3',str(self.base/'bin'/name),str(number),address],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         self.children.append(p);time.sleep(.06);return p
     def run_adg(self, action='sync', check=True):
-        return subprocess.run(['bash',str(self.base/'scripts/box.adg'),action],text=True,capture_output=True,timeout=35,check=check)
+        return subprocess.run(['bash',str(self.base/'scripts/box.adg'),action],text=True,capture_output=True,timeout=45,check=check,env={**os.environ,'MFR_ADG_OPERATION':'1'})
     def api(self, path, data=None):
         req=urllib.request.Request(f'http://127.0.0.1:{self.http}/control/'+path, data=None if data is None else json.dumps(data).encode(),headers={'Content-Type':'application/json'})
         with urllib.request.urlopen(req,timeout=5) as r:

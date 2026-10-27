@@ -198,6 +198,12 @@
     $("help-summary").textContent = enabled ? "程序使用说明" : "程序使用说明 • AGH隐藏入口";
     $("help-enable-adg").hidden = !state || enabled;
     $("help-enable-adg").disabled = busy || !state || enabled;
+    const reason = !enabled ? (state?.adguardhome?.error || "") : "";
+    $("adg-disabled-notice").hidden = !reason;
+    $("adg-disabled-notice").textContent = reason;
+    $("adg-recovery-notice").hidden = !reason;
+    $("adg-recovery-notice").textContent = reason ? "AGH 切换失败，已停用；可在帮助中重新启用。" : "";
+    $("help-enable-adg").textContent = reason ? "重新启用 AdGuard Home" : "启用 AdGuard Home";
   }
   function renderAdgState() {
     const adg = state.adguardhome || {};

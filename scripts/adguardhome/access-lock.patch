@@ -1,0 +1,75 @@
+diff --git a/internal/dnsforward/access.go b/internal/dnsforward/access.go
+index 3829b5b..d7f21a9 100644
+--- a/internal/dnsforward/access.go
++++ b/internal/dnsforward/access.go
+@@ -283,5 +283,7 @@ func (s *Server) handleAccessSet(w http.ResponseWriter, r *http.Request) {
+ 	s.conf.AllowedClients = list.AllowedClients
+ 	s.conf.DisallowedClients = list.DisallowedClients
+ 	s.conf.BlockedHosts = list.BlockedHosts
++	s.accessLock.Lock()
+ 	s.access = a
++	s.accessLock.Unlock()
+ }
+diff --git a/internal/dnsforward/dnsforward.go b/internal/dnsforward/dnsforward.go
+index e396e0c..59740f6 100644
+--- a/internal/dnsforward/dnsforward.go
++++ b/internal/dnsforward/dnsforward.go
+@@ -129,6 +129,11 @@ type Server struct {
+ 	// be nil.
+ 	tlsConfigProvider aghtls.TLSConfigProvider
+ 
++	// accessLock protects access independently of serverLock. Query accounting
++	// holds serverLock while client lookup checks access; never re-enter it.
++	// Writers that need both locks acquire serverLock before accessLock.
++	accessLock sync.RWMutex
++
+ 	// access drops disallowed clients.
+ 	access *accessManager
+ 
+@@ -510,7 +515,7 @@ func (s *Server) Prepare(ctx context.Context, conf *ServerConfig) (err error) {
+ 
+ 	s.setupDNS64()
+ 
+-	s.access, err = newAccessCtx(
++	access, err := newAccessCtx(
+ 		s.conf.AllowedClients,
+ 		s.conf.DisallowedClients,
+ 		s.conf.BlockedHosts,
+@@ -519,6 +524,10 @@ func (s *Server) Prepare(ctx context.Context, conf *ServerConfig) (err error) {
+ 		return fmt.Errorf("preparing access: %w", err)
+ 	}
+ 
++	s.accessLock.Lock()
++	s.access = access
++	s.accessLock.Unlock()
++
+ 	proxyConfig.Fallbacks, err = s.setupFallbackDNS()
+ 	if err != nil {
+ 		return fmt.Errorf("setting up fallback dns servers: %w", err)
+@@ -903,8 +912,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ // IsBlockedClient returns true if the client is blocked by the current access
+ // settings.
+ func (s *Server) IsBlockedClient(ip netip.Addr, clientID string) (blocked bool, rule string) {
+-	s.serverLock.RLock()
+-	defer s.serverLock.RUnlock()
++	s.accessLock.RLock()
++	defer s.accessLock.RUnlock()
+ 
+ 	blockedByIP := false
+ 	if ip != (netip.Addr{}) {
+diff --git a/internal/dnsforward/middleware.go b/internal/dnsforward/middleware.go
+index df31d56..ccb02df 100644
+--- a/internal/dnsforward/middleware.go
++++ b/internal/dnsforward/middleware.go
+@@ -83,7 +83,10 @@ func (s *Server) isBlockedHost(
+ 	qt := q.Qtype
+ 	host := aghnet.NormalizeDomain(q.Name)
+ 
+-	if s.access.isBlockedHost(host, qt) {
++	s.accessLock.RLock()
++	blocked = s.access.isBlockedHost(host, qt)
++	s.accessLock.RUnlock()
++	if blocked {
+ 		l.DebugContext(ctx, "request is in access blocklist")
+ 
+ 		return true

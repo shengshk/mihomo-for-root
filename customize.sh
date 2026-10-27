@@ -50,8 +50,9 @@ for utility in yq curl agh-dns-bridge; do
 done
 # AGH is optional; install its offline binary without enabling it or adding
 # personal DNS rules. Existing AGH configuration and data survive upgrades.
-[ -s "$data/bin/AdGuardHome" ] || cp "$MODPATH/assets/arm64-v8a/AdGuardHome" "$data/bin/AdGuardHome" || abort '! 安装 AGH 失败。'
-chmod 700 "$data/bin/AdGuardHome"
+cp "$MODPATH/assets/arm64-v8a/AdGuardHome" "$data/bin/AdGuardHome.next" || abort '! 更新 AGH 失败。'
+chmod 700 "$data/bin/AdGuardHome.next"
+mv "$data/bin/AdGuardHome.next" "$data/bin/AdGuardHome" || abort '! 更新 AGH 失败。'
 mkdir -p "$data/adguardhome" "$data/licenses"
 cp -af "$MODPATH/box/licenses/." "$data/licenses/" || abort '! 安装许可证失败。'
 [ -s "$data/adguardhome/AdGuardHome.yaml" ] || cp "$data/templates/AdGuardHome.yaml" "$data/adguardhome/AdGuardHome.yaml"

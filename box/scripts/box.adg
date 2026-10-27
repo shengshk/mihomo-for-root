@@ -9,6 +9,11 @@ scripts_dir="${0%/*}"
 . "$scripts_dir/adg-controls.utils"
 adg_paths
 mkdir -p "$adg_dir" "$box_run_state"
+# All preference changes and DNS restoration share the management lock. A
+# background caller delegates before acquiring the private AGH lock.
+if [ "$1" = sync ] && [ "${MFR_ADG_OPERATION:-0}" != 1 ]; then
+  exec "$scripts_dir/box.policy" adg-sync
+fi
 
 error() { printf '%s\n' "$1" > "$adg_error"; adg_diagnostic "$1"; return 1; }
 release() {
@@ -66,7 +71,8 @@ start_daemon() {
   rm -f "$adg_state"
   local count=0
   while [ "$count" -lt 8 ]; do
-    adg_api GET status >/dev/null && return 0
+    MFR_ADG_API_TIMEOUT=1 adg_api GET status >/dev/null && return 0
+    adg_alive || break
     sleep 1; count=$((count+1))
   done
   error 'AGH 启动失败'
@@ -84,7 +90,7 @@ switch_upstream() {
     [ "$expected" != "$(cat "$adg_state" 2>/dev/null)" ] || return 0
     # Check the actual DNS listener, not just an existing PID or controller.
     # No system fallback if the core is alive but its DNS is unready.
-    adg_dns_ready || { error 'Mihomo DNS 未就绪'; return 1; }
+    adg_dns_ready || { error 'Mihomo DNS 未就绪'; return 76; }
     servers="$mfr_dns_address"
   else
     snapshot=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network)
@@ -97,12 +103,54 @@ switch_upstream() {
   json=$(printf '%s\n' "$servers" | busybox awk 'BEGIN {printf "["} {for(i=1;i<=NF;i++){if(n++)printf ",";printf "\"%s\"",$i}} END {print "]"}')
   # A previous failed cache clear leaves no committed state, so the next sync
   # retries it. Changing cache settings manually in AGH remains possible.
-  adg_api POST dns_config --data-binary "{\"upstream_dns\":$json,\"upstream_dns_file\":\"\",\"fallback_dns\":[],\"use_private_ptr_resolvers\":false,\"local_ptr_upstreams\":[]}" >/dev/null || {
+  # A network change with the same upstream only needs cache invalidation.
+  # Supplying upstream_dns to AGH always rebuilds its DNS server.
+  local applied previous_servers
+  applied=$(cat "$adg_state" 2>/dev/null)
+  previous_servers=${applied##*|}
+  case "$applied" in mihomo\|*) previous_servers="$mfr_dns_address" ;; esac
+  if [ -z "$applied" ] || [ "$previous_servers" != "$servers" ]; then
+  MFR_ADG_API_TIMEOUT=4 adg_api POST dns_config --data-binary "{\"upstream_dns\":$json,\"upstream_dns_file\":\"\",\"fallback_dns\":[],\"use_private_ptr_resolvers\":false,\"local_ptr_upstreams\":[]}" >/dev/null || {
     error 'AGH 上游切换失败'; return 1;
   }
-  adg_api POST cache_clear --data-binary '{}' >/dev/null || { error 'AGH 缓存清理失败'; return 1; }
+  fi
+  MFR_ADG_API_TIMEOUT=4 adg_api POST cache_clear --data-binary '{}' >/dev/null || { error 'AGH 缓存清理失败'; return 1; }
   printf '%s\n' "$expected" > "$adg_state.next.$$" && mv "$adg_state.next.$$" "$adg_state" || return 1
   rm -f "$adg_error"
+}
+
+disable_failed_adg() {
+  # This is an explicit circuit breaker, never an answer-based DNS fallback.
+  # Preserve the user's hijack preference, rules, statistics and query logs.
+  [ "${MFR_ADG_OPERATION:-0}" = 1 ] || return 1
+  local reason='AGH 连续切换失败，已停用；可在帮助中重新启用。'
+  "$bin_dir/yq" -o=json '.adguardhome_enabled = false' "$preferences_file" > "$preferences_file.next.$$" &&
+    mv "$preferences_file.next.$$" "$preferences_file" || return 1
+  printf '%s\n' "$reason" > "$adg_disabled_reason" || return 1
+  : > "$adg_recovery_pending" || return 1
+  capture remove || { error 'AGH DNS 接管撤销失败'; return 1; }
+  stop_daemon
+  rm -f "$adg_error"
+  adg_diagnostic 'circuit disabled after 2 failures; DNS restoration pending'
+  return 78
+}
+
+sync_daemon() {
+  local mode="$1" attempt=1 result
+  while [ "$attempt" -le 2 ]; do
+    result=0
+    start_daemon && switch_upstream "$mode" || result=$?
+    [ "$result" -ne 0 ] || return 0
+    # A live core whose DNS is not ready must not trigger system DNS fallback.
+    [ "$result" -ne 76 ] || return 1
+    adg_diagnostic "switch attempt=$attempt/2 exit=$result"
+    [ "$attempt" -lt 2 ] || break
+    # A stuck API cannot repair itself through the same API. Replace its
+    # process once; shutdown is bounded even if an internal lock is wedged.
+    stop_daemon
+    attempt=$((attempt+1))
+  done
+  disable_failed_adg
 }
 
 trap release EXIT
@@ -134,9 +182,8 @@ case "$1" in
     fi
     # On failures capture stays installed: no hidden public/system DNS bypass.
     capture install || { error 'AGH DNS 接管失败'; exit 1; }
-    start_daemon || exit 1
     mode=auto; [ "$1" != before-stop ] || mode=system
-    switch_upstream "$mode" || exit 1
+    sync_daemon "$mode" || exit $?
     [ "$1" = before-stop ] || [ "${MFR_SKIP_ADG_CONTROLS:-0}" = 1 ] || adg_controls_sync || { error 'AGH 快捷设置应用失败'; exit 1; } ;;
   *) exit 1 ;;
 esac

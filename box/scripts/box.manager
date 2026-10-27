@@ -460,6 +460,10 @@ case "$1" in
     if [ "$("$yq" 'has("adg_controls")' "$request")" = true ]; then
       MFR_REQUEST="$request" "$yq" -i -o=json '.adg_controls = (load(strenv(MFR_REQUEST)).adg_controls | pick(["ipv6_filter","ipv6_allow","adblock","filter_urls"]))' "$work/preferences.next" || fail '无法保存 AGH 设置。'
     fi
+    if [ "$("$yq" -r '.adguardhome_enabled' "$work/preferences.next")" = true ] &&
+       { [ "$1" = adg-enable ] || [ "${section:-}" = agh ]; }; then
+      rm -f "$adg_disabled_reason"
+    fi
     mv "$work/preferences.next" "$preferences_file" || fail '无法保存设置。'
     was_running=false; running && was_running=true
     apply_needed=true
@@ -472,20 +476,25 @@ case "$1" in
     apply_failed=false
     if [ "$adg_reset" = true ]; then
       cp -p "$work/preferences.previous" "$adg_backup/preferences.json"
-      MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" replace-config "$work/adg-reset.yaml" >> "$work/apply.log" 2>&1 || apply_failed=true
+      adg_sync replace-config "$work/adg-reset.yaml" >> "$work/apply.log" 2>&1 || apply_failed=true
     fi
     if [ "$apply_failed" = false ] && [ "$apply_needed" = true ]; then
       MFR_SKIP_ADG_CONTROLS=1 apply_current || apply_failed=true
     fi
     if [ "$apply_failed" = false ]; then
-      MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" sync >> "$work/apply.log" 2>&1 || apply_failed=true
+      adg_sync sync >> "$work/apply.log" 2>&1 || apply_failed=true
     fi
     if [ "$apply_failed" = true ]; then
+      adg_tripped=false
+      if [ -f "$adg_disabled_reason" ] && [ "$("$yq" -r '.adguardhome_enabled' "$preferences_file")" = false ]; then adg_tripped=true; fi
       cp -p "$work/preferences.previous" "$preferences_file"
+      # A transaction rollback must not undo the circuit breaker and restart
+      # the same failed daemon on the next policy event.
+      [ "$adg_tripped" != true ] || "$yq" -i -o=json '.adguardhome_enabled = false' "$preferences_file"
       cp -p "$work/profiles.previous" "$db"
       if [ "$adg_reset" = true ]; then
         if [ -f "$adg_backup/AdGuardHome.yaml" ]; then
-          MFR_ADG_OPERATION=1 MFR_ADG_RESTORE=1 "$scripts_dir/box.adg" replace-config "$adg_backup/AdGuardHome.yaml" >> "$work/restore.log" 2>&1
+          MFR_ADG_RESTORE=1 adg_sync replace-config "$adg_backup/AdGuardHome.yaml" >> "$work/restore.log" 2>&1
         else
           "$scripts_dir/box.adg" stop >> "$work/restore.log" 2>&1
           rm -f "$adg_config"
@@ -496,7 +505,7 @@ case "$1" in
         "$scripts_dir/box.service" prepare > "$work/restore-prepare.log" 2>&1
         [ "$was_running" != true ] || "$scripts_dir/box.service" restart > "$work/restore.log" 2>&1
       fi
-      MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" sync >/dev/null 2>&1
+      adg_sync sync >/dev/null 2>&1
       fail '设置未能生效，已恢复原设置。'
     fi
     ok

@@ -1,1 +1,4 @@
 releases/*.zip binary
+
+# Unified patches must retain upstream context indentation and blank lines.
+*.patch -whitespace

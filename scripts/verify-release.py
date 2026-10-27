@@ -9,15 +9,16 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 
-def verify(archive_only=False):
-    metadata = json.loads((ROOT / 'releases/module.json').read_text())
-    archive = ROOT / 'releases' / metadata['file']
+def verify(archive_only=False, candidate=None):
+    metadata = None if candidate else json.loads((ROOT / 'releases/module.json').read_text())
+    archive = Path(candidate).resolve() if candidate else ROOT / 'releases' / metadata['file']
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    if digest != metadata['sha256']:
-        raise ValueError('成品 SHA256 与 releases/module.json 不一致')
-    checksums = (ROOT / 'releases/SHA256SUMS').read_text().split()
-    if checksums != [digest, archive.name]:
-        raise ValueError('SHA256SUMS 与成品不一致')
+    if metadata:
+        if digest != metadata['sha256']:
+            raise ValueError('成品 SHA256 与 releases/module.json 不一致')
+        checksums = (ROOT / 'releases/SHA256SUMS').read_text().split()
+        if checksums != [digest, archive.name]:
+            raise ValueError('SHA256SUMS 与成品不一致')
     with zipfile.ZipFile(archive) as package:
         bad = package.testzip()
         if bad:
@@ -38,10 +39,15 @@ def verify(archive_only=False):
                 if not source.is_file() or source.read_bytes() != package.read(name):
                     raise ValueError(f'成品与当前模块源码不一致: {name}')
         properties = dict(line.split('=', 1) for line in package.read('module.prop').decode().splitlines() if '=' in line)
-        if properties['version'] != metadata['version'] or int(properties['versionCode']) != metadata['versionCode']:
+        if metadata and (properties['version'] != metadata['version'] or int(properties['versionCode']) != metadata['versionCode']):
             raise ValueError('成品版本与发布记录不一致')
         dependencies = json.loads(package.read('assets/VERSIONS.json'))
         if not archive_only:
+            agh = dependencies['files']['arm64-v8a/AdGuardHome']
+            if agh.get('patch_sha256') != hashlib.sha256((ROOT / 'scripts/adguardhome/access-lock.patch').read_bytes()).hexdigest():
+                raise ValueError('AGH 与当前锁修复补丁不一致')
+            if hashlib.sha256(package.read('box/licenses/AdGuardHome-access-lock.patch')).hexdigest() != agh['patch_sha256']:
+                raise ValueError('AGH 随包补丁与二进制记录不一致')
             bridge = dependencies['files']['arm64-v8a/agh-dns-bridge']
             if bridge['source_sha256'] != hashlib.sha256((ROOT / 'scripts/agh-dns-bridge/main.go').read_bytes()).hexdigest():
                 raise ValueError('DNS 转发器与当前源码不一致')
@@ -53,9 +59,11 @@ def verify(archive_only=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--archive-only', action='store_true', help='校验归档及依赖，不对照当前源码')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--archive-only', action='store_true', help='校验归档及依赖，不对照当前源码')
+    mode.add_argument('--candidate', help='校验待手机验证的安装包，不替换已验证归档')
     args = parser.parse_args()
     try:
-        verify(args.archive_only)
+        verify(args.archive_only, args.candidate)
     except (OSError, ValueError, KeyError, zipfile.BadZipFile) as error:
         sys.exit(str(error))

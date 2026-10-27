@@ -7,6 +7,8 @@ adg_paths() {
   adg_pid="$box_run_state/adguardhome.pid"
   adg_state="$box_run_state/adguardhome.upstream"
   adg_error="$box_run_state/adguardhome.error"
+  adg_disabled_reason="$manage_dir/adguardhome-disabled"
+  adg_recovery_pending="$manage_dir/adguardhome-recovery-pending"
   adg_bridge_pid="$box_run_state/adguardhome-bridge.pid"
   adg_group=19054
 }
@@ -62,7 +64,7 @@ adg_api() {
   local curl_bin=/system/bin/curl error_file result=0 detail
   [ -x "$curl_bin" ] || curl_bin="$bin_dir/curl"
   error_file=$(mktemp "$box_run/.adg-api.XXXXXXXX") || return 1
-  "$curl_bin" --silent --show-error --fail --noproxy '*' --connect-timeout 1 --max-time 12 \
+  "$curl_bin" --silent --show-error --fail --noproxy '*' --connect-timeout 1 --max-time "${MFR_ADG_API_TIMEOUT:-12}" \
     --request "$method" --header 'Content-Type: application/json' "$@" "http://127.0.0.1:9092/control/$path" 2>"$error_file" || result=$?
   if [ "$result" -ne 0 ]; then
     detail=$(busybox head -c 512 "$error_file" | busybox tr '\r\n' '  ')
@@ -72,12 +74,25 @@ adg_api() {
   return "$result"
 }
 
+# Callers own operation.lock before entering box.adg. Its private lock is
+# released before runtime DNS is restored, keeping the lock order one-way.
+adg_sync() {
+  local result=0 phase="${1:-sync}"
+  MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" "$@" || result=$?
+  case "$result" in 0|78) ;; *) return "$result" ;; esac
+  if [ -f "$manage_dir/adguardhome-recovery-pending" ]; then
+    "$scripts_dir/box.service" adg-recover "$phase" || return 1
+  fi
+  return 0
+}
+
 # Read only live API state. The IPv6 DNS transport guard is separate from AAAA
 # answer filtering; never infer the latter from ip6tables or the daemon PID.
 adg_status() {
   local directory="$1" network_file="$2" running=false available=false upstream=unknown aaaa=unknown message
   local info="$1/adg-dns.json" probe="$1/adg-aaaa.json"
-  message=$(cat "$adg_error" 2>/dev/null)
+  message=$(cat "$adg_disabled_reason" 2>/dev/null)
+  [ -n "$message" ] || message=$(cat "$adg_error" 2>/dev/null)
   if adg_alive; then
     running=true
     if adg_api GET dns_info > "$info" && "$bin_dir/yq" -e '.upstream_dns | tag == "!!seq"' "$info" >/dev/null 2>&1; then
@@ -112,6 +127,7 @@ adg_status() {
      "error":strenv(MFR_ADG_ERROR),"capture":strenv(MFR_ADG_CAPTURE)}'
 }
 adg_health_needed() {
+  [ ! -f "$adg_recovery_pending" ] || return 0
   [ "${adguardhome_enabled:-false}" = true ] || return 1
   [ ! -f /data/adb/modules/box_for_root/disable ] || return 0
   adg_alive || return 0

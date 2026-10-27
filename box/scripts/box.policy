@@ -105,10 +105,19 @@ reconcile() {
   esac
   [ "$wanted" != stopped ] || rm -f "$paused_file"
   if [ "$synced" != true ]; then
-    [ ! -f "$scripts_dir/box.adg" ] || MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" sync || return $?
+    [ ! -f "$scripts_dir/box.adg" ] || adg_sync sync || return $?
   fi
   "$scripts_dir/box.service" describe >/dev/null 2>&1
   return 0
+}
+
+sync_adg_policy() {
+  local result=0
+  acquire || return 75
+  adg_sync sync || result=$?
+  release
+  . /data/adb/box/settings.ini
+  return "$result"
 }
 
 refresh_apps() {
@@ -211,12 +220,12 @@ case "$1" in
           last_network="$network"
         elif [ "$now" -ge "$next_adg_retry" ] &&
              { [ "$network" != "$last_network" ] || adg_health_needed; }; then
-          "$scripts_dir/box.adg" sync >/dev/null 2>&1
+          sync_adg_policy >/dev/null 2>&1
           if [ "$?" = 0 ]; then last_network="$network"; else next_adg_retry=$((now+30)); fi
         fi
       fi
       if [ "$now" -ge "$next_adg_retry" ] && adg_health_needed; then
-        "$scripts_dir/box.adg" sync >/dev/null 2>&1
+        sync_adg_policy >/dev/null 2>&1
         next_adg_retry=$((now+30))
       fi
       # Retain the cheap package-file check; query UIDs only after it changes.
@@ -231,6 +240,8 @@ case "$1" in
       [ "$retries" -le 0 ] || wait_seconds=2
       mfr_events_wait "$wait_seconds" && network_event=true
     done ;;
+  adg-sync)
+    sync_adg_policy ;;
   reconcile)
     acquire || exit $?
     reconcile "${2:-false}" ;;

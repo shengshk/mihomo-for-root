@@ -1,0 +1,7 @@
+AdGuard Home v0.107.79-mfr.1 (GPL-3.0)
+Upstream source: https://github.com/AdguardTeam/AdGuardHome/tree/05ba17b282da1c4393d6a4ba4db0cf519194a362
+Local changes: AdGuardHome-access-lock.patch (included alongside this notice).
+Build and regression sources: scripts/adguardhome/ in https://github.com/shengshk/mihomo-for-root
+The patch separates access-control locking from the server lifecycle lock to
+prevent recursive read-lock deadlocks during query accounting/reconfiguration.
+The upstream web UI, query logging, statistics and access checks are retained.
