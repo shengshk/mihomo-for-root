@@ -53,7 +53,7 @@ refresh() {
 case "$1" in
   start)
     if ! watcher_alive; then
-      nohup /system/bin/sh "$0" watch </dev/null >/dev/null 2>&1 &
+      nohup "$scripts_dir/box.daemon" /system/bin/sh "$0" watch </dev/null >/dev/null 2>&1 &
     fi
     ;;
   stop)

@@ -407,7 +407,7 @@ box_run_bin() {
       return 1
     }
   fi
-  nohup busybox setuidgid "${box_user_group}" "${bin_path}" -d "${box_dir}/mihomo" -f "${box_dns_runtime}" > "${bin_log}" 2>&1 &
+  nohup "$scripts_dir/box.daemon" busybox setuidgid "${box_user_group}" "${bin_path}" -d "${box_dir}/mihomo" -f "${box_dns_runtime}" > "${bin_log}" 2>&1 &
   PID=$!
   printf '%s' "$PID" > "$box_pid"
   phase=$(mfr_millis)

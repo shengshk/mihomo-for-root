@@ -45,7 +45,7 @@ case "$1" in
     printf 'root\n' > "$cron_dir/cron.update"
     if ! alive; then
       unset MFR_REQUEST_FILE MFR_PAYLOAD
-      SHELL=/system/bin/sh nohup busybox crond -f -c "$cron_dir" -L /dev/null </dev/null >/dev/null 2>&1 &
+      SHELL=/system/bin/sh nohup "$scripts_dir/box.daemon" busybox crond -f -c "$cron_dir" -L /dev/null </dev/null >/dev/null 2>&1 &
       printf '%s\n' "$!" > "$pid_file"
     fi
     ;;

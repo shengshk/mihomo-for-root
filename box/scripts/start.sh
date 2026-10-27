@@ -54,7 +54,7 @@ net_inotifyd() {
 
   net_dir="/data/misc/net"
   # Use inotifyd to monitor write events in the /data/misc/net directory for network changes, perhaps we have a better choice of files to monitor (the /proc filesystem is unsupported) and cyclic polling is a bad solution
-  inotifyd "${scripts_dir}/net.inotify" "${net_dir}" > "/dev/null" 2>&1 &
+  "${scripts_dir}/box.daemon" inotifyd "${scripts_dir}/net.inotify" "${net_dir}" > "/dev/null" 2>&1 &
 }
 
 start_inotifyd() {
@@ -67,7 +67,7 @@ start_inotifyd() {
       # kill -9 "$PID"
     # fi
   done
-  inotifyd "${scripts_dir}/box.inotify" "${moddir}" > "/dev/null" 2>&1 &
+  "${scripts_dir}/box.daemon" inotifyd "${scripts_dir}/box.inotify" "${moddir}" > "/dev/null" 2>&1 &
   net_inotifyd
 }
 

@@ -95,7 +95,7 @@ exit 0
 ''')
         self.write('bin/mihomo', DNS_SERVER)
         self.write('bin/system-dns', DNS_SERVER)
-        for name in ('box.adg', 'adg.utils', 'adg-capture.utils', 'dns.utils', 'network.utils', 'ports.utils', 'adg-controls.utils'):
+        for name in ('box.adg', 'box.daemon', 'daemon.utils', 'adg.utils', 'adg-capture.utils', 'dns.utils', 'network.utils', 'ports.utils', 'adg-controls.utils'):
             source = (ROOT/'box/scripts'/name).read_text().replace('/data/adb/box', str(self.base)).replace('/system/bin/sh', '/bin/bash')
             source = source.replace('/system/bin/curl', str(self.base/'bin/curl'))
             source = source.replace('127.0.0.1:9092', f'127.0.0.1:{self.http}').replace('mfr_dns_port=15353', f'mfr_dns_port={self.core}')
@@ -107,6 +107,7 @@ exit 0
                     'adg_bridge_start() { echo fixture > "$adg_bridge_pid"; }\n'
                     'adg_bridge_stop() { rm -f "$adg_bridge_pid"; }\n')
             self.write('scripts/'+name, source)
+        self.write('scripts/daemon.utils', '#!/bin/sh\nmfr_daemon_detach() { return 0; }\n')
         # Model the default network; the Android dump parser has separate tests.
         self.write('network-id', '1\n')
         with (self.base/'scripts/dns.utils').open('a') as f:

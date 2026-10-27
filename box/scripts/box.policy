@@ -160,7 +160,7 @@ case "$1" in
   start)
     "$scripts_dir/box.http" start >/dev/null 2>&1
     if ! alive "$policy_pid" box.policy; then
-      nohup /system/bin/sh "$0" watch </dev/null >/dev/null 2>&1 &
+      nohup "$scripts_dir/box.daemon" /system/bin/sh "$0" watch </dev/null >/dev/null 2>&1 &
     fi ;;
   stop) if alive "$policy_pid" box.policy; then kill "$(cat "$policy_pid")" 2>/dev/null; fi ;;
   watch)

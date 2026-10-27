@@ -1,0 +1,25 @@
+#!/system/bin/sh
+# A daemon must leave the caller's Android app cgroups before it starts work.
+# nohup/setsid alone do not change cgroup inheritance. Never unfreeze an app.
+mfr_daemon_detach() {
+  local pid="${1:-$$}" groups mount failed=false
+  case "$pid" in ''|*[!0-9]*|0|1) return 1 ;; esac
+  [ -d "/proc/$pid" ] || return 1
+  # Escape the freezer first, then the app's legacy resource controllers.
+  groups=$(busybox awk '
+    $3=="cgroup2" {print $2}
+    $3=="cgroup" {legacy=legacy $2 "\n"}
+    END {printf "%s",legacy}' /proc/mounts) || return 1
+  while IFS= read -r mount; do
+    [ -n "$mount" ] || continue
+    [ -f "$mount/cgroup.procs" ] || { failed=true; continue; }
+    # cgroup.procs migrates the entire thread group, including existing Go
+    # worker threads. The mount root is outside Android's app freezer groups.
+    if ! { printf '%s\n' "$pid" > "$mount/cgroup.procs"; } 2>/dev/null; then
+      failed=true
+    fi
+  done <<GROUPS
+$groups
+GROUPS
+  [ "$failed" = false ]
+}

@@ -26,7 +26,7 @@ case "$1" in
     cp "$scripts_dir/http.cgi" "$web/cgi-bin/manager"
     chmod 700 "$web/cgi-bin/manager"
     printf '.webmanifest:application/manifest+json\n.svg:image/svg+xml\n.js:application/javascript\n' > "$web/httpd.conf"
-    nohup busybox httpd -f -p 127.0.0.1:9091 -h "$web" -c "$web/httpd.conf" </dev/null > "$box_run/manager-http.log" 2>&1 &
+    nohup "$scripts_dir/box.daemon" busybox httpd -f -p 127.0.0.1:9091 -h "$web" -c "$web/httpd.conf" </dev/null > "$box_run/manager-http.log" 2>&1 &
     printf '%s\n' "$!" > "$pid_file"
     ;;
   stop)

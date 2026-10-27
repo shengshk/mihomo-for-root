@@ -27,6 +27,7 @@ class ManagerFixture:
         for p in (ROOT/'box/scripts').iterdir():
             if p.is_file():
                 self.write('scripts/'+p.name, p.read_text().replace('/system/bin/sh','/bin/bash').replace('/data/adb/box', str(self.base)))
+        self.write('scripts/daemon.utils', '#!/bin/sh\nmfr_daemon_detach() { return 0; }\n')
         for p in (ROOT/'webroot').iterdir():
             if p.is_file(): shutil.copy(p,self.base/'web'/p.name)
         (self.base/'web/index.html').chmod(0o600)

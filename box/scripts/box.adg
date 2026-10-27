@@ -60,7 +60,7 @@ start_daemon() {
   "$bin_dir/AdGuardHome" --check-config -c "$adg_config" -w "$adg_dir" > "$box_run/adguardhome-check.log" 2>&1 || {
     error 'AGH 配置错误'; return 1;
   }
-  SSL_CERT_DIR=/system/etc/security/cacerts:/apex/com.android.conscrypt/cacerts nohup busybox setuidgid "0:$adg_group" "$bin_dir/AdGuardHome" -c "$adg_config" -w "$adg_dir" --no-check-update \
+  SSL_CERT_DIR=/system/etc/security/cacerts:/apex/com.android.conscrypt/cacerts nohup "$scripts_dir/box.daemon" busybox setuidgid "0:$adg_group" "$bin_dir/AdGuardHome" -c "$adg_config" -w "$adg_dir" --no-check-update \
     </dev/null > "$box_run/adguardhome.log" 2>&1 &
   printf '%s\n' "$!" > "$adg_pid"
   rm -f "$adg_state"

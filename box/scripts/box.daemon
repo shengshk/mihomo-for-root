@@ -1,0 +1,7 @@
+#!/system/bin/sh
+# Common exec boundary for every long-lived module process.
+scripts_dir="${0%/*}"
+. "$scripts_dir/daemon.utils"
+[ "$#" -gt 0 ] || exit 1
+mfr_daemon_detach "$$" || { echo '无法将后台服务移出应用进程组。' >&2; exit 1; }
+exec "$@"

@@ -40,7 +40,7 @@ adg_bridge_start() {
   adg_bridge_alive && return 0
   [ -x "$bin_dir/agh-dns-bridge" ] || return 1
   rm -f "$adg_bridge_pid"
-  nohup busybox setuidgid "0:$adg_group" "$bin_dir/agh-dns-bridge" \
+  nohup "${scripts_dir:-$box_dir/scripts}/box.daemon" busybox setuidgid "0:$adg_group" "$bin_dir/agh-dns-bridge" \
     -listen6 "[::1]:$adg_bridge_port" -upstream4 "$adg_dns_address" -ready-file "$adg_bridge_pid" \
     </dev/null > "$box_run/adguardhome-bridge.log" 2>&1 &
   local child=$! count=0

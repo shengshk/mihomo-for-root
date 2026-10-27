@@ -7,7 +7,10 @@ cd "$(dirname "$0")"
 stage=$(pwd)
 box_dir="$stage"
 box_run="$stage/run"; box_run_state="$box_run/state"; bin_dir="$stage/bin"
-mkdir -p "$box_run_state" "$bin_dir" "$stage/data"
+scripts_dir="$stage/scripts"
+mkdir -p "$box_run_state" "$bin_dir" "$stage/data" "$scripts_dir"
+cp "$stage/box.daemon" "$stage/daemon.utils" "$scripts_dir/"
+chmod 700 "$scripts_dir/box.daemon" "$scripts_dir/daemon.utils"
 cp "$stage/agh-dns-bridge" "$bin_dir/agh-dns-bridge"
 . "$stage/ports.utils"
 adg_bridge_pid="$box_run_state/adguardhome-bridge.pid"; adg_group=19054
