@@ -7,6 +7,7 @@ adg_paths() {
   adg_pid="$box_run_state/adguardhome.pid"
   adg_state="$box_run_state/adguardhome.upstream"
   adg_error="$box_run_state/adguardhome.error"
+  adg_bridge_pid="$box_run_state/adguardhome-bridge.pid"
   adg_group=19054
 }
 adg_alive() {
@@ -14,6 +15,12 @@ adg_alive() {
   p=$(cat "$adg_pid" 2>/dev/null)
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
   kill -0 "$p" 2>/dev/null && grep -q '/bin/AdGuardHome' "/proc/$p/cmdline" 2>/dev/null
+}
+adg_bridge_alive() {
+  local p
+  p=$(cat "$adg_bridge_pid" 2>/dev/null)
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null && grep -q '/bin/agh-dns-bridge' "/proc/$p/cmdline" 2>/dev/null
 }
 adg_core_alive() {
   local p
@@ -108,6 +115,9 @@ adg_health_needed() {
   [ "${adguardhome_enabled:-false}" = true ] || return 1
   [ ! -f /data/adb/modules/box_for_root/disable ] || return 0
   adg_alive || return 0
+  if [ "$(cat "$box_run_state/adguardhome.capture" 2>/dev/null)" = dual-tproxy ]; then
+    adg_bridge_alive || return 0
+  fi
   [ ! -s "$adg_error" ] || return 0
   local applied
   IFS='|' read -r applied _ < "$adg_state" 2>/dev/null

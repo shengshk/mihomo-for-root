@@ -41,6 +41,10 @@ def verify(archive_only=False):
         if properties['version'] != metadata['version'] or int(properties['versionCode']) != metadata['versionCode']:
             raise ValueError('成品版本与发布记录不一致')
         dependencies = json.loads(package.read('assets/VERSIONS.json'))
+        if not archive_only:
+            bridge = dependencies['files']['arm64-v8a/agh-dns-bridge']
+            if bridge['source_sha256'] != hashlib.sha256((ROOT / 'scripts/agh-dns-bridge/main.go').read_bytes()).hexdigest():
+                raise ValueError('DNS 转发器与当前源码不一致')
         for name, info in dependencies['files'].items():
             content = package.read('assets/' + name)
             if len(content) != info['bytes'] or hashlib.sha256(content).hexdigest() != info['sha256']:

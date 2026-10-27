@@ -151,7 +151,7 @@
     const enabled = $("adg-enabled").checked;
     $("dns-hijack-mode").querySelectorAll("button").forEach(button => button.disabled = busy || enabled);
     $("dns-hijack-mode").hidden = enabled;
-    $("dns-hijack-label").textContent = enabled ? "Mihomo DNS 劫持：关闭 · AGH 接管" : "Mihomo DNS 劫持";
+    $("dns-hijack-label").textContent = enabled ? "DNS 劫持：关闭 · AGH 接管" : "DNS 劫持";
     $("dns-hijack-help").hidden = enabled;
     $("adg-shortcuts").disabled = busy || !enabled;
     $("adg-ipv6-allow").disabled = busy || !enabled || !$("adg-ipv6-filter").checked;

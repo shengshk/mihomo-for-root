@@ -26,6 +26,7 @@ fi
 for file in assets/arm64-v8a/AdGuardHome assets/arm64-v8a/mihomo assets/arm64-v8a/yq assets/arm64-v8a/curl assets/dashboard.zip assets/geodata/GeoIP.dat assets/geodata/GeoSite.dat assets/geodata/Country.mmdb assets/geodata/ASN.mmdb; do
   [ -s "$file" ] || { echo "缺少离线安装资源: $file" >&2; exit 1; }
 done
+sh scripts/build-dns-bridge.sh
 mkdir -p dist
 output="$(pwd)/dist/mihomo-for-root-1.0.zip"
 rm -f "$output"

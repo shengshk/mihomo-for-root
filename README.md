@@ -16,6 +16,7 @@
 | 广告过滤订阅 | [217heidai/adblockfilters](https://github.com/217heidai/adblockfilters) |
 | GeoIP、GeoSite、Country、ASN 数据 | [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) |
 | 配置处理与下载 | [yq](https://github.com/mikefarah/yq)、[curl](https://github.com/curl/curl) |
+| DNS 转发器运行库 | [Go](https://go.dev/) |
 | Shell 工具与本地管理服务 | [BusyBox](https://busybox.net/) |
 | Root 模块生态 | [Magisk](https://github.com/topjohnwu/Magisk)、[KernelSU](https://github.com/tiann/KernelSU)、[APatch](https://github.com/bmax121/APatch) |
 
@@ -79,7 +80,7 @@
 
 [下载模块与校验值](https://github.com/shengshk/mihomo-for-root/releases/latest)
 
-📦 离线安装包约 **66 MB**，包含 Mihomo、AdGuard Home、Zashboard、工具，以及 **GeoSite 域名库、GeoIP IP 库、Country 国家库和 ASN 数据库**。这些组件和数据已内置，支持离线安装，因此体积较大。
+📦 离线安装包约 **67 MB**，包含 Mihomo、AdGuard Home、Zashboard、工具，以及 **GeoSite 域名库、GeoIP IP 库、Country 国家库和 ASN 数据库**。这些组件和数据已内置，支持离线安装，因此体积较大。
 
 ## 安装使用
 
@@ -113,7 +114,7 @@ Zashboard 端口随配置变化，从模块管理页打开可自动填写连接�
 
 ## AdGuard Home 怎么用
 
-启用后，手机普通 DNS 请求先进入 AGH：**Mihomo 运行时，上游使用 Mihomo DNS；Mihomo 停止时，上游使用系统 DNS**。切换上游自动清缓存，AGH 与 Mihomo DNS 劫持互斥。
+启用后，手机普通 DNS 请求先进入 AGH：**Mihomo 运行时，上游使用 Mihomo DNS；Mihomo 停止时，上游使用系统 DNS**。切换上游自动清缓存，AGH 与 Mihomo DNS 劫持互斥。IPv4／IPv6 的 TCP、UDP 53 请求统一交给 AGH；缺少 IPv6 NAT 时使用独立的透明转发器，不依赖 Mihomo 的 TUN 或 IPv6 开关。
 
 - 阻止 IPv6 解析只过滤 AAAA 查询，不关闭手机 IPv6；可填写放行域名。
 - 广告拦截默认关闭，启用前注意可能影响部分应用。域名、订阅链接均支持整行 `#` 注释。
@@ -128,7 +129,7 @@ GitHub 仓库仅接受 PR，不开放 Issues。请附上清晰的问题描述、
 
 ## 构建与维护
 
-执行 `bash build.sh`，成品输出到 `dist/`；缺少依赖缓存时，会从 `releases/` 中的离线包恢复。构建需要 Python 3、zip/unzip。
+执行 `bash build.sh`，成品输出到 `dist/`；缺少依赖缓存时，会从 `releases/` 中的离线包恢复。构建需要 Python 3、zip/unzip。修改 DNS 转发器源码后需要 Go 1.23+；使用匹配的离线资源时无需 Go。可用 `MFR_GO_BIN` 指定 Go 路径。
 
 GitHub 源码不包含安装包。首次构建前，从同版本 Release 下载 `mihomo-for-root-1.0.zip`、`SHA256SUMS`、`module.json`，放入仓库的 `releases/` 目录，再运行构建。无需刷入手机即可构建。
 

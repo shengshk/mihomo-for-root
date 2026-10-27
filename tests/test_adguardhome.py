@@ -48,7 +48,7 @@ family=Path(sys.argv[0]).name
 if 'REDIRECT' in rule and '-p' not in rule:sys.exit(2)
 if family=='ip6tables' and table=='nat' and (base/'no-nat6').exists():sys.exit(1)
 key=family+':'+table+':'+chain
-if chain=='OUTPUT':db.setdefault(key,[])
+if chain in ('OUTPUT','PREROUTING'):db.setdefault(key,[])
 ok=True
 if op=='-N':
  ok=key not in db
@@ -85,13 +85,27 @@ class AdGuardHomeTest(unittest.TestCase):
         self.write('bin/busybox', '#!/bin/sh\nif [ "$1" = setuidgid ]; then shift 2; exec "$@"; fi\nexec /usr/bin/busybox "$@"\n')
         for family in ('iptables', 'ip6tables'): self.write('bin/'+family, FIREWALL)
         self.write('bin/dumpsys', '#!/bin/sh\nexit 0\n')
+        self.write('bin/ip', f'''#!/bin/sh
+case "$*" in
+ '-6 rule show pref '*) cat "{self.base}/route-rule" 2>/dev/null; exit 0 ;;
+ '-6 rule add '*) echo '90: from all fwmark 0x8000000/0x8000000 lookup 2054' > "{self.base}/route-rule" ;;
+ '-6 rule del '*) rm -f "{self.base}/route-rule" ;;
+esac
+exit 0
+''')
         self.write('bin/mihomo', DNS_SERVER)
         self.write('bin/system-dns', DNS_SERVER)
-        for name in ('box.adg', 'adg.utils', 'dns.utils', 'network.utils', 'ports.utils', 'adg-controls.utils'):
+        for name in ('box.adg', 'adg.utils', 'adg-capture.utils', 'dns.utils', 'network.utils', 'ports.utils', 'adg-controls.utils'):
             source = (ROOT/'box/scripts'/name).read_text().replace('/data/adb/box', str(self.base)).replace('/system/bin/sh', '/bin/bash')
             source = source.replace('/system/bin/curl', str(self.base/'bin/curl'))
             source = source.replace('127.0.0.1:9092', f'127.0.0.1:{self.http}').replace('mfr_dns_port=15353', f'mfr_dns_port={self.core}')
             source = source.replace('--no-check-update', '--no-check-update --no-permcheck')
+            if name == 'box.adg':
+                # Host fixtures emulate lifecycle only. Real IPv6 sockets/routes
+                # are checked by fixtures/agh_dns_namespace.sh on Android.
+                source=source.replace('. "$scripts_dir/adg-capture.utils"', '. "$scripts_dir/adg-capture.utils"\n'
+                    'adg_bridge_start() { echo fixture > "$adg_bridge_pid"; }\n'
+                    'adg_bridge_stop() { rm -f "$adg_bridge_pid"; }\n')
             self.write('scripts/'+name, source)
         # Model the default network; the Android dump parser has separate tests.
         self.write('network-id', '1\n')
@@ -244,12 +258,13 @@ adguardhome_enabled=true
         self.assertEqual(self.api('dns_info')['disable_ipv6'],dns['disable_ipv6'])
         self.assertFalse((self.base/'run/state/adg-controls.applied').exists())
 
-    def test_missing_nat6_uses_closed_ipv6_transport_and_disable_removes_rules(self):
+    def test_missing_nat6_uses_bridge_and_disable_removes_rules(self):
         (self.base/'no-nat6').touch();self.run_adg()
-        self.assertEqual((self.base/'run/state/adguardhome.capture').read_text().strip(),'ipv4-ipv6-reject')
-        db=json.loads((self.base/'firewall.json').read_text());self.assertEqual(len(db['ip6tables:filter:OUTPUT']),2)
+        self.assertEqual((self.base/'run/state/adguardhome.capture').read_text().strip(),'dual-tproxy')
+        db=json.loads((self.base/'firewall.json').read_text());self.assertEqual(len(db['ip6tables:mangle:OUTPUT']),2);self.assertEqual(db['ip6tables:filter:OUTPUT'],[])
         (self.base/'disabled').touch();self.run_adg()
-        db=json.loads((self.base/'firewall.json').read_text());self.assertEqual(db['iptables:nat:OUTPUT'],[]);self.assertEqual(db['ip6tables:filter:OUTPUT'],[])
+        db=json.loads((self.base/'firewall.json').read_text());self.assertEqual(db['iptables:nat:OUTPUT'],[]);self.assertEqual(db['ip6tables:filter:OUTPUT'],[]);self.assertEqual(db['ip6tables:mangle:OUTPUT'],[])
+        self.assertFalse((self.base/'run/state/adguardhome-bridge.pid').exists())
         self.assertFalse((self.base/'run/state/adguardhome.pid').exists())
 
     def test_live_core_dns_timeout_never_falls_back(self):
@@ -277,7 +292,7 @@ adguardhome_enabled=true
         # Stale applied state must not override the live API.
         (self.base/'run/state/adguardhome.upstream').write_text('mihomo|99999\n')
         actual=self.status();self.assertEqual(actual['upstream'],'system');self.assertEqual(actual['aaaa_filter'],'disabled')
-        self.assertEqual(actual['capture'],'ipv4-ipv6-reject')
+        self.assertEqual(actual['capture'],'dual-tproxy')
         self.api('filtering/set_rules',{'rules':['$dnstype=AAAA,denyallow=example.com|example.net,dnsrewrite=NOERROR;;']})
         self.assertEqual(self.status()['aaaa_filter'],'enabled')
         self.api('dns_config',{'upstream_dns':[f'127.0.0.1:{self.core}']})

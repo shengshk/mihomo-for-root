@@ -4,6 +4,14 @@ mfr_dns_port=15353
 mfr_dns_address="127.0.0.1:$mfr_dns_port"
 mfr_dns_hex=$(printf '%04X' "$mfr_dns_port")
 
+# Independent AGH entry and its IPv6 transport. Marks do not overlap Mihomo.
+adg_dns_port=1054
+adg_dns_address="127.0.0.1:$adg_dns_port"
+adg_bridge_port=1055
+adg_v6_mark="134217728/134217728"
+adg_v6_table=2054
+adg_v6_pref=90
+
 # Run only after an actual bind failure, not on each readiness poll.
 mfr_dns_port_owners() {
   local owner pid name command

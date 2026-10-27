@@ -29,3 +29,5 @@ textarea[wrap=off]{white-space:pre;overflow-wrap:normal;word-break:normal;overfl
 .notice.info{border-left-color:var(--accent)}
 
 #open-dashboard:disabled{cursor:not-allowed}
+
+#adg-enable-dialog{width:calc(100% - 48px);max-width:380px;max-height:calc(100dvh - 48px);margin:auto}#adg-enable-help p{font-size:13px;line-height:1.7;color:var(--muted);margin:12px 0}

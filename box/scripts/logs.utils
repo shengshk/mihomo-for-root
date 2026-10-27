@@ -9,7 +9,11 @@ mfr_log_read() {
     module) mfr_log_tail "$box_run/runs.log" 100 ;;
     mihomo) mfr_log_tail "$box_run/mihomo.log" 100 ;;
     agh)
-      mfr_log_tail "$box_run/adguardhome.log" 80
+      mfr_log_tail "$box_run/adguardhome.log" 70
+      if [ -s "$box_run/adguardhome-bridge.log" ]; then
+        printf '\n[IPv6 DNS 转发]\n'
+        mfr_log_tail "$box_run/adguardhome-bridge.log" 10
+      fi
       if [ -s "$box_run/adguardhome-events.log" ]; then
         printf '\n[AGH 模块操作]\n'
         mfr_log_tail "$box_run/adguardhome-events.log" 20

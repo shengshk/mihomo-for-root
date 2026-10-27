@@ -1,0 +1,137 @@
+#!/system/bin/sh
+# DNS capture belongs to AGH, independently of core mode and application policy.
+rules_family() {
+  local tool="$1" action="$2" proto
+  if [ "$action" = remove ]; then
+    for proto in udp tcp; do
+      while "$tool" -w 3 -t nat -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH_DNS 2>/dev/null; do
+        "$tool" -w 3 -t nat -D OUTPUT -p "$proto" --dport 53 -j MFR_AGH_DNS || return 1
+      done
+    done
+    "$tool" -w 3 -t nat -F MFR_AGH_DNS 2>/dev/null
+    "$tool" -w 3 -t nat -X MFR_AGH_DNS 2>/dev/null
+    return 0
+  fi
+  # Idempotent: do not flush a working chain on each network notification.
+  if ! "$tool" -w 3 -t nat -C MFR_AGH_DNS -p tcp -j REDIRECT --to-ports 1054 >/dev/null 2>&1; then
+    "$tool" -w 3 -t nat -N MFR_AGH_DNS 2>/dev/null || "$tool" -w 3 -t nat -F MFR_AGH_DNS || return 1
+    "$tool" -w 3 -t nat -A MFR_AGH_DNS -m owner --uid-owner 0 --gid-owner "$adg_group" -j RETURN || return 1
+    "$tool" -w 3 -t nat -A MFR_AGH_DNS -m owner --uid-owner 0 --gid-owner 3005 -j RETURN || return 1
+    "$tool" -w 3 -t nat -A MFR_AGH_DNS -p udp -j REDIRECT --to-ports 1054 || return 1
+    "$tool" -w 3 -t nat -A MFR_AGH_DNS -p tcp -j REDIRECT --to-ports 1054 || return 1
+  fi
+  for proto in udp tcp; do
+    "$tool" -w 3 -t nat -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH_DNS 2>/dev/null ||
+      "$tool" -w 3 -t nat -I OUTPUT 1 -p "$proto" --dport 53 -j MFR_AGH_DNS || return 1
+  done
+}
+adg_remove_legacy_v6_block() {
+  local proto
+  for proto in udp tcp; do
+    while ip6tables -w 3 -t filter -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH_V6 2>/dev/null; do
+      ip6tables -w 3 -t filter -D OUTPUT -p "$proto" --dport 53 -j MFR_AGH_V6 || return 1
+    done
+  done
+  ip6tables -w 3 -t filter -F MFR_AGH_V6 2>/dev/null
+  ip6tables -w 3 -t filter -X MFR_AGH_V6 2>/dev/null
+  return 0
+}
+adg_bridge_start() {
+  adg_bridge_alive && return 0
+  [ -x "$bin_dir/agh-dns-bridge" ] || return 1
+  rm -f "$adg_bridge_pid"
+  nohup busybox setuidgid "0:$adg_group" "$bin_dir/agh-dns-bridge" \
+    -listen6 "[::1]:$adg_bridge_port" -upstream4 "$adg_dns_address" -ready-file "$adg_bridge_pid" \
+    </dev/null > "$box_run/adguardhome-bridge.log" 2>&1 &
+  local child=$! count=0
+  while [ "$count" -lt 5 ]; do
+    adg_bridge_alive && return 0
+    kill -0 "$child" 2>/dev/null || break
+    sleep 1; count=$((count+1))
+  done
+  kill "$child" 2>/dev/null
+  rm -f "$adg_bridge_pid"
+  return 1
+}
+adg_bridge_stop() {
+  local p count=0
+  if adg_bridge_alive; then
+    p=$(cat "$adg_bridge_pid")
+    kill "$p" 2>/dev/null
+    while kill -0 "$p" 2>/dev/null && [ "$count" -lt 3 ]; do sleep 1; count=$((count+1)); done
+    kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null
+  fi
+  rm -f "$adg_bridge_pid"
+}
+adg_v6_rule() {
+  ip6tables -w 3 -t mangle -C "$@" 2>/dev/null || ip6tables -w 3 -t mangle -A "$@"
+}
+adg_v6_capture() {
+  local action="$1" proto rules
+  if [ "$action" = remove ]; then
+    for proto in udp tcp; do
+      while ip6tables -w 3 -t mangle -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH6_OUT 2>/dev/null; do
+        ip6tables -w 3 -t mangle -D OUTPUT -p "$proto" --dport 53 -j MFR_AGH6_OUT || return 1
+      done
+    done
+    while ip6tables -w 3 -t mangle -C PREROUTING -i lo -m mark --mark "$adg_v6_mark" -j MFR_AGH6_IN 2>/dev/null; do
+      ip6tables -w 3 -t mangle -D PREROUTING -i lo -m mark --mark "$adg_v6_mark" -j MFR_AGH6_IN || return 1
+    done
+    for rules in MFR_AGH6_OUT MFR_AGH6_IN; do
+      ip6tables -w 3 -t mangle -F "$rules" 2>/dev/null
+      ip6tables -w 3 -t mangle -X "$rules" 2>/dev/null
+    done
+    while ip -6 rule show pref "$adg_v6_pref" | grep -Eq 'fwmark (0x8000000|134217728)/'; do
+      ip -6 rule del pref "$adg_v6_pref" fwmark "$adg_v6_mark" lookup "$adg_v6_table" || return 1
+    done
+    ip -6 route del local ::/0 dev lo table "$adg_v6_table" 2>/dev/null
+    return 0
+  fi
+  # Do not overwrite another component's policy routing slot.
+  rules=$(ip -6 rule show pref "$adg_v6_pref") || return 1
+  if [ -n "$rules" ] && ! printf '%s\n' "$rules" | grep -Eq "fwmark (0x8000000|134217728)/(0x8000000|134217728) lookup $adg_v6_table"; then return 1; fi
+  ip -6 route replace local ::/0 dev lo table "$adg_v6_table" || return 1
+  [ -n "$rules" ] || ip -6 rule add pref "$adg_v6_pref" fwmark "$adg_v6_mark" lookup "$adg_v6_table" || return 1
+  for rules in MFR_AGH6_OUT MFR_AGH6_IN; do
+    ip6tables -w 3 -t mangle -N "$rules" 2>/dev/null || ip6tables -w 3 -t mangle -S "$rules" >/dev/null || return 1
+  done
+  adg_v6_rule MFR_AGH6_OUT -m owner --uid-owner 0 --gid-owner "$adg_group" -j RETURN || return 1
+  adg_v6_rule MFR_AGH6_OUT -m owner --uid-owner 0 --gid-owner 3005 -j RETURN || return 1
+  adg_v6_rule MFR_AGH6_OUT -j MARK --set-xmark "$adg_v6_mark" || return 1
+  # End this mangle traversal before the core's application/TUN rules.
+  adg_v6_rule MFR_AGH6_OUT -j ACCEPT || return 1
+  for proto in udp tcp; do
+    adg_v6_rule MFR_AGH6_IN -p "$proto" --dport 53 -j TPROXY --on-ip ::1 --on-port "$adg_bridge_port" --tproxy-mark "$adg_v6_mark" || return 1
+  done
+  ip6tables -w 3 -t mangle -C PREROUTING -i lo -m mark --mark "$adg_v6_mark" -j MFR_AGH6_IN 2>/dev/null ||
+    ip6tables -w 3 -t mangle -I PREROUTING 1 -i lo -m mark --mark "$adg_v6_mark" -j MFR_AGH6_IN || return 1
+  for proto in udp tcp; do
+    ip6tables -w 3 -t mangle -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH6_OUT 2>/dev/null ||
+      ip6tables -w 3 -t mangle -I OUTPUT 1 -p "$proto" --dport 53 -j MFR_AGH6_OUT || return 1
+  done
+}
+capture() {
+  if [ "$1" = remove ]; then
+    rules_family iptables remove || return 1
+    rules_family ip6tables remove || return 1
+    adg_v6_capture remove || return 1
+    adg_remove_legacy_v6_block || return 1
+    adg_bridge_stop
+    rm -f "$box_run_state/adguardhome.capture"
+    return 0
+  fi
+  rules_family iptables install || return 1
+  if ip6tables -w 3 -t nat -S OUTPUT >/dev/null 2>&1; then
+    rules_family ip6tables install || return 1
+    adg_v6_capture remove || return 1
+    adg_bridge_stop
+    adg_remove_legacy_v6_block || return 1
+    printf 'dual\n' > "$box_run_state/adguardhome.capture"
+  else
+    adg_bridge_start || return 1
+    adg_v6_capture install || return 1
+    # Withdraw the old reject rules only after the replacement is ready.
+    adg_remove_legacy_v6_block || return 1
+    printf 'dual-tproxy\n' > "$box_run_state/adguardhome.capture"
+  fi
+}

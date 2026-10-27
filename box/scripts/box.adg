@@ -34,74 +34,7 @@ acquire() {
 
 # Capture only this phone's ordinary DNS, independently of proxy application
 # selection. Owner exceptions are strict: no UID-only fallback that exempts netd.
-rules_family() {
-  local tool="$1" action="$2" proto
-  if [ "$action" = remove ]; then
-    for proto in udp tcp; do
-      while "$tool" -w 3 -t nat -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH_DNS 2>/dev/null; do
-        "$tool" -w 3 -t nat -D OUTPUT -p "$proto" --dport 53 -j MFR_AGH_DNS || return 1
-      done
-    done
-    "$tool" -w 3 -t nat -F MFR_AGH_DNS 2>/dev/null
-    "$tool" -w 3 -t nat -X MFR_AGH_DNS 2>/dev/null
-    return 0
-  fi
-  # Idempotent: do not flush a working chain on each network notification.
-  if ! "$tool" -w 3 -t nat -C MFR_AGH_DNS -p tcp -j REDIRECT --to-ports 1054 >/dev/null 2>&1; then
-    "$tool" -w 3 -t nat -N MFR_AGH_DNS 2>/dev/null || "$tool" -w 3 -t nat -F MFR_AGH_DNS || return 1
-    "$tool" -w 3 -t nat -A MFR_AGH_DNS -m owner --uid-owner 0 --gid-owner "$adg_group" -j RETURN || return 1
-    "$tool" -w 3 -t nat -A MFR_AGH_DNS -m owner --uid-owner 0 --gid-owner 3005 -j RETURN || return 1
-    "$tool" -w 3 -t nat -A MFR_AGH_DNS -p udp -j REDIRECT --to-ports 1054 || return 1
-    "$tool" -w 3 -t nat -A MFR_AGH_DNS -p tcp -j REDIRECT --to-ports 1054 || return 1
-  fi
-  for proto in udp tcp; do
-    "$tool" -w 3 -t nat -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH_DNS 2>/dev/null ||
-      "$tool" -w 3 -t nat -I OUTPUT 1 -p "$proto" --dport 53 -j MFR_AGH_DNS || return 1
-  done
-}
-v6_block() {
-  local action="$1" proto
-  if [ "$action" = remove ]; then
-    for proto in udp tcp; do
-      while ip6tables -w 3 -t filter -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH_V6 2>/dev/null; do
-        ip6tables -w 3 -t filter -D OUTPUT -p "$proto" --dport 53 -j MFR_AGH_V6 || return 1
-      done
-    done
-    ip6tables -w 3 -t filter -F MFR_AGH_V6 2>/dev/null
-    ip6tables -w 3 -t filter -X MFR_AGH_V6 2>/dev/null
-    return 0
-  fi
-  if ! ip6tables -w 3 -t filter -C MFR_AGH_V6 -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null; then
-    ip6tables -w 3 -t filter -N MFR_AGH_V6 2>/dev/null || ip6tables -w 3 -t filter -F MFR_AGH_V6 || return 1
-    ip6tables -w 3 -t filter -A MFR_AGH_V6 -m owner --uid-owner 0 --gid-owner "$adg_group" -j RETURN || return 1
-    ip6tables -w 3 -t filter -A MFR_AGH_V6 -m owner --uid-owner 0 --gid-owner 3005 -j RETURN || return 1
-    ip6tables -w 3 -t filter -A MFR_AGH_V6 -j REJECT --reject-with icmp6-port-unreachable || return 1
-  fi
-  for proto in udp tcp; do
-    ip6tables -w 3 -t filter -C OUTPUT -p "$proto" --dport 53 -j MFR_AGH_V6 2>/dev/null ||
-      ip6tables -w 3 -t filter -I OUTPUT 1 -p "$proto" --dport 53 -j MFR_AGH_V6 || return 1
-  done
-}
-capture() {
-  if [ "$1" = remove ]; then
-    rules_family iptables remove || return 1
-    rules_family ip6tables remove || return 1
-    v6_block remove || return 1
-    rm -f "$box_run_state/adguardhome.capture"
-    return 0
-  fi
-  rules_family iptables install || return 1
-  if ip6tables -w 3 -t nat -S OUTPUT >/dev/null 2>&1; then
-    rules_family ip6tables install || return 1
-    v6_block remove
-    printf 'dual\n' > "$box_run_state/adguardhome.capture"
-  else
-    # No NAT6 on many Android kernels. Fail closed for IPv6 DNS transport;
-    # IPv4 resolvers can still return allowed AAAA records.
-    v6_block install || return 1
-    printf 'ipv4-ipv6-reject\n' > "$box_run_state/adguardhome.capture"
-  fi
-}
+. "$scripts_dir/adg-capture.utils"
 stop_daemon() {
   if adg_alive; then
     local p count=0

@@ -1972,14 +1972,35 @@ disable_ipv6() {
   sysctl -w net.ipv4.ip_forward=1
   sysctl -w net.ipv6.conf.all.forwarding=0
 
-  set_ipv6_conf_all accept_ra 0
-  set_ipv6_conf_all disable_ipv6 1
+  if [ "${adguardhome_enabled:-false}" = true ]; then
+    # DNS must reach OUTPUT before it can be intercepted. A routing-level
+    # unreachable rule would reject it too early. Block only other data here.
+    ipv6_enable
+    ip6tables -w 3 -t filter -N BOX_IPV6_OFF 2>/dev/null || true
+    ip6tables -w 3 -t filter -F BOX_IPV6_OFF || return 1
+    ip6tables -w 3 -t filter -A BOX_IPV6_OFF -p ipv6-icmp -j RETURN || return 1
+    ip6tables -w 3 -t filter -A BOX_IPV6_OFF -d ::1 -j RETURN || return 1
+    ip6tables -w 3 -t filter -A BOX_IPV6_OFF -m owner --uid-owner 0 --gid-owner 19054 -j RETURN || return 1
+    ip6tables -w 3 -t filter -A BOX_IPV6_OFF -p udp --dport 53 -j RETURN || return 1
+    ip6tables -w 3 -t filter -A BOX_IPV6_OFF -p tcp --dport 53 -j RETURN || return 1
+    ip6tables -w 3 -t filter -A BOX_IPV6_OFF -j REJECT || return 1
+    ip6tables -w 3 -t filter -C OUTPUT -j BOX_IPV6_OFF 2>/dev/null || ip6tables -w 3 -t filter -I OUTPUT 1 -j BOX_IPV6_OFF
+    return $?
+  else
+    set_ipv6_conf_all accept_ra 0
+    set_ipv6_conf_all disable_ipv6 1
+  fi
 
   # 添加不可达规则，阻断 IPv6 流量继续转发。
   ip -6 rule show pref "${pref}" 2>/dev/null | busybox grep -q "unreachable" || ip -6 rule add unreachable pref "${pref}"
 } >/dev/null 2>&1
 
 ipv6_enable() {
+  while ip6tables -w 3 -t filter -C OUTPUT -j BOX_IPV6_OFF 2>/dev/null; do
+    ip6tables -w 3 -t filter -D OUTPUT -j BOX_IPV6_OFF || return 1
+  done
+  ip6tables -w 3 -t filter -F BOX_IPV6_OFF 2>/dev/null || true
+  ip6tables -w 3 -t filter -X BOX_IPV6_OFF 2>/dev/null || true
   sysctl -w net.ipv4.ip_forward=1
   sysctl -w net.ipv6.conf.all.forwarding=1
 
