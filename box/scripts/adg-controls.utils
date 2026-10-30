@@ -76,7 +76,9 @@ adg_controls_change() {
     MFR_RULE="$rule" "$bin_dir/yq" -i '.rules += [strenv(MFR_RULE)]' "$directory/rules.json" || return 1
   fi
   adg_api POST filtering/set_rules --data-binary "@$directory/rules.json" >/dev/null || return 1
-  adg_api POST dns_config --data-binary '{"disable_ipv6":false}' >/dev/null || return 1
+  if [ "$("$bin_dir/yq" 'has("ipv6_dns")' "$preferences_file")" != true ]; then
+    adg_api POST dns_config --data-binary '{"disable_ipv6":false}' >/dev/null || return 1
+  fi
   if [ "$enabled" = true ] || [ "$("$bin_dir/yq" -r '.ipv6_filter' "$wanted")" = true ]; then
     "$bin_dir/yq" -o=json '{"enabled":true,"interval":.interval}' "$directory/before.json" > "$directory/payload.json"
     adg_api POST filtering/config --data-binary "@$directory/payload.json" >/dev/null || return 1
@@ -114,10 +116,14 @@ adg_controls_sync() (
   "$bin_dir/yq" -e '.adg_controls | tag == "!!map"' "$pref" >/dev/null 2>&1 || exit 0
   digest=$("$bin_dir/yq" -o=json -I=0 '.adg_controls' "$pref" | busybox sha256sum)
   expected="$(cat "$adg_pid")|${digest%% *}"
+  [ "$("$bin_dir/yq" 'has("ipv6_dns")' "$pref")" != true ] || expected="$expected|dns-gate"
   [ "$expected" != "$(cat "$stamp" 2>/dev/null)" ] || exit 0
   directory=$(mktemp -d "$box_run_state/.adg-controls.XXXXXXXX") || exit 1
   trap 'rm -rf "$directory"' EXIT
   "$bin_dir/yq" -o=json '.adg_controls' "$pref" > "$directory/wanted.json"
+  if [ "$("$bin_dir/yq" 'has("ipv6_dns")' "$pref")" = true ]; then
+    "$bin_dir/yq" -i '.ipv6_filter = false | .ipv6_allow = []' "$directory/wanted.json" || exit 1
+  fi
   adg_controls_valid "$directory/wanted.json" || exit 1
   adg_controls_effective "$directory/wanted.json" > "$directory/wanted.next" &&
     mv "$directory/wanted.next" "$directory/wanted.json" || exit 1

@@ -1,0 +1,81 @@
+#!/system/bin/sh
+umask 077
+scripts_dir="${0%/*}"
+. /data/adb/box/settings.ini
+. "$scripts_dir/dns.utils"
+. "$scripts_dir/adg.utils"
+. "$scripts_dir/dns-gate.utils"
+. "$scripts_dir/dns-gate-capture.utils"
+gate_paths
+mkdir -p "$box_run_state"
+error() { printf '%s\n' "$1" > "$gate_error"; return 1; }
+stop_gate() {
+ gate_capture remove || return 1
+ if gate_alive; then
+  local p count=0;p=$(cat "$gate_pid");kill "$p" 2>/dev/null
+  while kill -0 "$p" 2>/dev/null && [ "$count" -lt 5 ]; do sleep 1;count=$((count+1));done
+  kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null
+ fi
+ rm -f "$gate_pid" "$gate_state" "$gate_error"
+}
+legacy_cleanup() (
+ . "$scripts_dir/adg-capture.utils"
+ adg_paths
+ capture legacy-remove
+)
+case "$1" in
+ stop) stop_gate; exit $? ;;
+ sync)
+  [ "${MFR_ADG_OPERATION:-0}" = 1 ] || exec "$scripts_dir/box.policy" adg-sync
+  if [ -f /data/adb/modules/box_for_root/disable ]; then stop_gate;exit $?;fi
+  gate_migrate || { error 'IPv6 DNS 设置迁移失败';exit 1; }
+  snapshot=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network_all)
+  servers=${snapshot##*\|};backend=system
+  if [ "${adguardhome_enabled:-false}" = true ]; then
+   adg_paths;adg_alive || { error 'AGH 未就绪';exit 1; }
+   backend=agh;servers="$adg_dns_address"
+  elif [ "${2:-sync}" != before-stop ] && adg_core_alive &&
+       { [ "${dns_hijack_tcp:-false}" = true ] || [ "${dns_hijack_udp:-false}" = true ]; }; then
+   adg_dns_ready || { error 'Mihomo DNS 未就绪';exit 1; }
+   backend=mihomo;servers="$mfr_dns_address"
+  fi
+  [ -n "$servers" ] || servers='127.0.0.1:1'
+  candidate="$gate_config.next.$$"
+  dumpsys connectivity 2>/dev/null | gate_networks > "$candidate.networks"
+  gate_carrier_rules "$candidate.carrier" || { error '运营商 DNS 规则无效';exit 1; }
+  mv "$candidate.carrier" "$box_run_state/carrier-dns.txt" || exit 1
+  carrier_version=$(busybox sha256sum "$box_run_state/carrier-dns.txt");carrier_version=${carrier_version%% *}
+  geosite=$(gate_geosite) || geosite=''
+  cn_version=$(gate_cn_version) || cn_version=''
+
+  gate_preferences > "$candidate.policy" || exit 1
+  MFR_CARRIER_VERSION="$carrier_version" MFR_GATE_NETWORKS="$candidate.networks" MFR_GATE_GEOSITE="$geosite" MFR_GATE_CN_VERSION="$cn_version" MFR_GATE_CARRIER="$box_run_state/carrier-dns.txt" MFR_GATE_POLICY="$candidate.policy" MFR_GATE_BACKEND="$backend" MFR_GATE_SERVERS="$servers" MFR_GATE_NETWORK="$snapshot" \
+   "$bin_dir/yq" -n -o=json 'load(strenv(MFR_GATE_POLICY)) * load(strenv(MFR_GATE_NETWORKS)) * {"carrier_version":strenv(MFR_CARRIER_VERSION),"geosite":strenv(MFR_GATE_GEOSITE),"cn_version":strenv(MFR_GATE_CN_VERSION),"carrier_file":strenv(MFR_GATE_CARRIER),"backend":strenv(MFR_GATE_BACKEND),"upstreams":(strenv(MFR_GATE_SERVERS) | split(" ")),"network":strenv(MFR_GATE_NETWORK)}' > "$candidate"
+  rm -f "$candidate.policy" "$candidate.networks"
+  "$bin_dir/dns-gate" -config "$candidate" -check || { rm -f "$candidate";error 'IPv6 DNS 配置无效';exit 1; }
+  digest=$(busybox sha256sum "$candidate");digest=${digest%% *}
+  mv "$candidate" "$gate_config" || exit 1
+  if gate_alive && [ "$(cat "$box_run_state/dns-gate.capture" 2>/dev/null)" != transparent-v2 ];then
+   # Candidate was validated before withdrawing the previous listener/capture.
+   stop_gate || exit 1
+  fi
+  if gate_alive; then
+   if [ "$("$bin_dir/yq" -r '.digest' "$gate_state" 2>/dev/null)" != "$digest" ]; then kill -HUP "$(cat "$gate_pid")" || exit 1;fi
+  else
+
+   nohup "$scripts_dir/box.daemon" busybox setuidgid "0:$gate_group" "$bin_dir/dns-gate" \
+    -config "$gate_config" -listen4 "$dns_gate_address" -transparent4 "127.0.0.1:$gate_bridge_port" -transparent6 "[::1]:$gate_bridge_port" -ready-file "$gate_pid" -state-file "$gate_state" \
+    </dev/null > "$box_run/dns-gate.log" 2>&1 &
+  fi
+  count=0
+  while [ "$count" -lt 5 ]; do
+   if gate_alive && [ "$("$bin_dir/yq" -r '.digest' "$gate_state" 2>/dev/null)" = "$digest" ]; then break;fi
+   sleep 1;count=$((count+1))
+  done
+  gate_alive && [ "$("$bin_dir/yq" -r '.digest' "$gate_state" 2>/dev/null)" = "$digest" ] || { error 'IPv6 DNS 服务启动或重载失败';exit 1; }
+  gate_capture install || { error 'IPv6 DNS 接管失败';exit 1; }
+  legacy_cleanup || { error '旧 DNS 接管清理失败';exit 1; }
+  rm -f "$gate_error"
+  ;;
+ *) exit 1 ;;
+esac

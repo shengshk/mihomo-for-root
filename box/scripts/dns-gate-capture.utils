@@ -1,0 +1,97 @@
+#!/system/bin/sh
+# TPROXY retains the original DNS target for mandatory carrier-domain bypass.
+# Only module-owned mark bits/tables/chains are changed.
+gate_bridge_stop() {
+ local p count=0
+ if gate_bridge_alive; then
+  p=$(cat "$gate_bridge_pid");kill "$p" 2>/dev/null
+  while kill -0 "$p" 2>/dev/null && [ "$count" -lt 3 ];do sleep 1;count=$((count+1));done
+  kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null
+ fi
+ rm -f "$gate_bridge_pid"
+}
+gate_old_capture_remove() {
+ local tool proto
+ for tool in iptables ip6tables;do
+  for proto in tcp udp;do
+   while "$tool" -w 3 -t nat -C OUTPUT -p "$proto" --dport 53 -j MFR_DNS_GATE_DNS 2>/dev/null;do "$tool" -w 3 -t nat -D OUTPUT -p "$proto" --dport 53 -j MFR_DNS_GATE_DNS || return 1;done
+  done
+  "$tool" -w 3 -t nat -F MFR_DNS_GATE_DNS 2>/dev/null
+  "$tool" -w 3 -t nat -X MFR_DNS_GATE_DNS 2>/dev/null
+ done
+ for proto in tcp udp;do
+  while ip6tables -w 3 -t filter -C OUTPUT -p "$proto" --dport 53 -j MFR_DNS_GATE_V6 2>/dev/null;do ip6tables -w 3 -t filter -D OUTPUT -p "$proto" --dport 53 -j MFR_DNS_GATE_V6 || return 1;done
+ done
+ ip6tables -w 3 -t filter -F MFR_DNS_GATE_V6 2>/dev/null
+ ip6tables -w 3 -t filter -X MFR_DNS_GATE_V6 2>/dev/null
+ return 0
+}
+gate_family_capture() {
+ local family="$1" action="$2" tool ipcmd chain out input proto n wanted previous nat=true
+ if [ "$family" = 4 ];then tool=iptables;ipcmd=ip;chain=MFR_DNS_GATE4;else tool=ip6tables;ipcmd='ip -6';chain=MFR_DNS_GATE6;fi
+ out=${chain}_OUT;input=${chain}_IN
+ if [ "$action" = remove ];then
+  for proto in udp tcp;do
+   while "$tool" -w 3 -t mangle -C OUTPUT -p "$proto" --dport 53 -j "$out" 2>/dev/null;do "$tool" -w 3 -t mangle -D OUTPUT -p "$proto" --dport 53 -j "$out" || return 1;done
+   while "$tool" -w 3 -t nat -C OUTPUT -p "$proto" --dport 53 -j MFR_CARRIER_DNS 2>/dev/null;do "$tool" -w 3 -t nat -D OUTPUT -p "$proto" --dport 53 -j MFR_CARRIER_DNS || return 1;done
+  done
+  while "$tool" -w 3 -t mangle -C PREROUTING -i lo -m mark --mark "$gate_v6_mark" -j "$input" 2>/dev/null;do "$tool" -w 3 -t mangle -D PREROUTING -i lo -m mark --mark "$gate_v6_mark" -j "$input" || return 1;done
+  for n in "$out" "$input";do "$tool" -w 3 -t mangle -F "$n" 2>/dev/null;"$tool" -w 3 -t mangle -X "$n" 2>/dev/null;done
+  # Core NAT chains may still reference this empty compatibility chain.
+  "$tool" -w 3 -t nat -F MFR_CARRIER_DNS 2>/dev/null
+  "$tool" -w 3 -t nat -X MFR_CARRIER_DNS 2>/dev/null
+  while $ipcmd rule show pref "$gate_v6_pref" | grep -Eq 'fwmark (0x10000000|268435456)/';do $ipcmd rule del pref "$gate_v6_pref" fwmark "$gate_v6_mark" lookup "$gate_v6_table" || return 1;done
+  $ipcmd route del local "$( [ "$family" = 4 ] && echo 0.0.0.0/0 || echo ::/0 )" dev lo table "$gate_v6_table" 2>/dev/null
+  rm -f "$box_run_state/dns-gate.capture.$family"
+  return 0
+ fi
+ previous=$($ipcmd rule show pref "$gate_v6_pref") || return 1
+ [ -z "$previous" ] || printf '%s\n' "$previous" | grep -Eq "fwmark (0x10000000|268435456)/(0x10000000|268435456) lookup $gate_v6_table" || return 1
+ $ipcmd route replace local "$( [ "$family" = 4 ] && echo 0.0.0.0/0 || echo ::/0 )" dev lo table "$gate_v6_table" || return 1
+ [ -n "$previous" ] || $ipcmd rule add pref "$gate_v6_pref" fwmark "$gate_v6_mark" lookup "$gate_v6_table" || return 1
+ for n in "$out" "$input";do "$tool" -w 3 -t mangle -N "$n" 2>/dev/null || "$tool" -w 3 -t mangle -S "$n" >/dev/null || return 1;done
+ # A private service network can be created without changing the default network.
+ # Rebuild only if its protected netId inventory actually changed.
+ wanted=$("$bin_dir/yq" -r '[.networks[] | select(.protected == true) | .id] | sort | map(to_string) | join(" ")' "$gate_state") || return 1
+ previous=$(cat "$box_run_state/dns-gate.capture.$family" 2>/dev/null)
+ if [ "$previous" != "v2:$wanted" ] || ! "$tool" -w 3 -t mangle -C "$out" -j MARK --set-xmark "$gate_v6_mark" 2>/dev/null;then
+  "$tool" -w 3 -t mangle -F "$out" || return 1
+  for n in "$gate_group" 19054 3005;do "$tool" -w 3 -t mangle -A "$out" -m owner --uid-owner 0 --gid-owner "$n" -j ACCEPT || return 1;done
+  for n in $wanted;do
+   case "$n" in ''|*[!0-9]*) return 1;;esac
+   "$tool" -w 3 -t mangle -A "$out" -m mark --mark "$n/65535" -j ACCEPT || return 1
+  done
+  "$tool" -w 3 -t mangle -A "$out" -j MARK --set-xmark "$gate_v6_mark" || return 1
+  "$tool" -w 3 -t mangle -A "$out" -j ACCEPT || return 1
+  if "$tool" -w 3 -t nat -S OUTPUT >/dev/null 2>&1;then
+   "$tool" -w 3 -t nat -N MFR_CARRIER_DNS 2>/dev/null || true
+   "$tool" -w 3 -t nat -F MFR_CARRIER_DNS || return 1
+   for n in $wanted;do "$tool" -w 3 -t nat -A MFR_CARRIER_DNS -m mark --mark "$n/65535" -j ACCEPT || return 1;done
+  fi
+  printf 'v2:%s\n' "$wanted" > "$box_run_state/dns-gate.capture.$family"
+ fi
+ for proto in udp tcp;do
+  "$tool" -w 3 -t mangle -C "$input" -p "$proto" --dport 53 -j TPROXY --on-ip "$( [ "$family" = 4 ] && echo 127.0.0.1 || echo ::1 )" --on-port "$gate_bridge_port" --tproxy-mark "$gate_v6_mark" 2>/dev/null ||
+   "$tool" -w 3 -t mangle -A "$input" -p "$proto" --dport 53 -j TPROXY --on-ip "$( [ "$family" = 4 ] && echo 127.0.0.1 || echo ::1 )" --on-port "$gate_bridge_port" --tproxy-mark "$gate_v6_mark" || return 1
+  "$tool" -w 3 -t mangle -C OUTPUT -p "$proto" --dport 53 -j "$out" 2>/dev/null || "$tool" -w 3 -t mangle -I OUTPUT 1 -p "$proto" --dport 53 -j "$out" || return 1
+  if "$tool" -w 3 -t nat -S OUTPUT >/dev/null 2>&1;then
+   "$tool" -w 3 -t nat -C OUTPUT -p "$proto" --dport 53 -j MFR_CARRIER_DNS 2>/dev/null || "$tool" -w 3 -t nat -I OUTPUT 1 -p "$proto" --dport 53 -j MFR_CARRIER_DNS || return 1
+  fi
+ done
+ "$tool" -w 3 -t mangle -C PREROUTING -i lo -m mark --mark "$gate_v6_mark" -j "$input" 2>/dev/null || "$tool" -w 3 -t mangle -I PREROUTING 1 -i lo -m mark --mark "$gate_v6_mark" -j "$input" || return 1
+}
+gate_capture() {
+ if [ "$1" = remove ];then
+  gate_family_capture 4 remove || return 1
+  gate_family_capture 6 remove || return 1
+  gate_old_capture_remove || return 1
+  gate_bridge_stop
+  rm -f "$box_run_state/dns-gate.capture"
+  return 0
+ fi
+ gate_family_capture 4 install || return 1
+ gate_family_capture 6 install || return 1
+ gate_old_capture_remove || return 1
+ gate_bridge_stop
+ printf 'transparent-v2\n' > "$box_run_state/dns-gate.capture"
+}

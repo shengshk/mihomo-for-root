@@ -105,3 +105,37 @@ box_dns_api_reload() {
   [ "$http_code" = 204 ]
 }
 
+
+box_dns_parse_network_all() {
+  awk '
+    function ipv4(s, a, n, i) {
+      n=split(s,a,"."); if(n!=4) return 0
+      for(i=1;i<=4;i++) if(a[i] !~ /^[0-9]+$/ || a[i]+0>255) return 0
+      return a[1]+0>0 && a[1]+0!=127 && a[1]+0<224
+    }
+    /Active default network:/ { active=$NF; next }
+    /^[[:space:]]*NetworkAgentInfo[[:space:]]*\{/ {
+      record=($0 ~ "network\\{" active "\\}");
+    }
+    record && /InterfaceName:/ && /DnsAddresses:/ {
+      line=$0; sub(/^.*InterfaceName:[[:space:]]*/,"",line)
+      split(line,parts,/[[:space:]}]/); interface=parts[1]
+      line=$0; sub(/^.*DnsAddresses:[[:space:]]*\[/,"",line)
+      sub(/\].*$/,"",line); n=split(line,addresses,/[[:space:],]+/)
+      dns=""
+      for(i=1;i<=n;i++) {
+        value=addresses[i]; sub(/^\//,"",value)
+        numeric=value; sub(/%.*/,"",numeric)
+        if(numeric ~ /^[fF][eE]80:/ && value !~ /%/) value=value "%" interface
+        if((ipv4(value) || (numeric ~ /:/ && numeric ~ /^[0-9a-fA-F:]+$/)) && !seen[value]++) dns=dns (dns==""?"":" ") value
+      }
+      found=1; record=0
+    }
+    END {
+      if(active ~ /^[0-9]+$/ && found && interface !~ /^(lo|tun[0-9]*|utun[0-9]*|meta)$/)
+        print active "|" interface "|" dns
+      else print "none||"
+    }
+  '
+}
+

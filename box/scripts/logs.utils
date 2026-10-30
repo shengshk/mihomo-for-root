@@ -6,7 +6,12 @@ mfr_log_tail() {
 }
 mfr_log_read() {
   case "$1" in
-    module) mfr_log_tail "$box_run/runs.log" 100 ;;
+    module)
+      mfr_log_tail "$box_run/runs.log" 85
+      if [ -s "$box_run_state/dns-gate.error" ]; then
+        printf '\n[统一 DNS]\n'; mfr_log_tail "$box_run_state/dns-gate.error" 2
+      fi
+      if [ -s "$box_run/dns-gate.log" ]; then mfr_log_tail "$box_run/dns-gate.log" 10; fi ;;
     mihomo) mfr_log_tail "$box_run/mihomo.log" 100 ;;
     agh)
       mfr_log_tail "$box_run/adguardhome.log" 70

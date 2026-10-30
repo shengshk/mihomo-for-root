@@ -1,0 +1,5 @@
+# Always preserve the original DNS/network for these carrier service suffixes.
+# 3GPP TS 23.003 IMS, ePDG, XCAP and legacy GPRS naming.
+# Carrier-specific names are discovered from Android service configuration.
+3gppnetwork.org
+gprs

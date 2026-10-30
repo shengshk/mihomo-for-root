@@ -1,0 +1,173 @@
+#!/system/bin/sh
+# Shared preference migration, lifecycle and observed chain status.
+gate_paths() {
+ gate_pid="$box_run_state/dns-gate.pid"
+ gate_state="$box_run_state/dns-gate.applied.json"
+ gate_config="$box_run_state/dns-gate.json"
+ gate_error="$box_run_state/dns-gate.error"
+ gate_bridge_pid="$box_run_state/dns-gate-bridge.pid"
+ gate_group=19055
+}
+gate_alive() {
+ local p; p=$(cat "$gate_pid" 2>/dev/null)
+ case "$p" in ''|*[!0-9]*) return 1 ;; esac
+ kill -0 "$p" 2>/dev/null && grep -q '/bin/dns-gate' "/proc/$p/cmdline" 2>/dev/null
+}
+gate_bridge_alive() {
+ local p; p=$(cat "$gate_bridge_pid" 2>/dev/null)
+ case "$p" in ''|*[!0-9]*) return 1 ;; esac
+ kill -0 "$p" 2>/dev/null && grep -q '/bin/agh-dns-bridge' "/proc/$p/cmdline" 2>/dev/null
+}
+gate_preferences() {
+ [ -s "$preferences_file" ] || { printf '%s\n' '{"mode":"on","blacklist":[],"whitelist":[]}'; return 0; }
+ "$bin_dir/yq" -o=json '.ipv6_dns // {"mode":(select(.adg_controls.ipv6_filter == true) | "whitelist") // "on", "blacklist":[], "whitelist":(.adg_controls.ipv6_allow // [])}' "$preferences_file"
+}
+gate_valid() {
+ "$bin_dir/yq" -e '((keys - ["mode","china_ipv6","blacklist","whitelist"]) | length == 0) and
+  (.mode == "on" or .mode == "off" or .mode == "blacklist" or .mode == "whitelist") and
+  ((has("china_ipv6") == false) or (.china_ipv6 | tag == "!!bool")) and
+  (.blacklist | tag == "!!seq" and length <= 2048) and (.whitelist | tag == "!!seq" and length <= 2048) and
+  ([(.blacklist + .whitelist)[] | select(tag != "!!str" or length > 512 or test("[\\r\\n]"))] | length == 0) and
+  ([(.blacklist + .whitelist)[] | sub("^\\s+"; "") | sub("\\s+$"; "") |
+    select(length > 0 and test("^#") == false) | sub("^(\\*\\.|\\+\\.)"; "") | sub("\\.$"; "") |
+    select(length > 253 or test("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$") == false)] | length == 0)' "$1" >/dev/null 2>&1
+}
+gate_migrate() {
+ [ -s "$preferences_file" ] || return 0
+ [ "$("$bin_dir/yq" 'has("ipv6_dns")' "$preferences_file")" != true ] || return 0
+ local candidate="$box_run_state/ipv6-dns.migrate.$$"
+ gate_preferences > "$candidate" && gate_valid "$candidate" || { rm -f "$candidate"; return 1; }
+ MFR_GATE_PREF="$candidate" "$bin_dir/yq" -o=json '.ipv6_dns = load(strenv(MFR_GATE_PREF))' "$preferences_file" > "$preferences_file.next.$$" &&
+  mv "$preferences_file.next.$$" "$preferences_file"
+ local result=$?; rm -f "$candidate"; return "$result"
+}
+gate_sync() {
+ [ "${dns_gate_managed:-false}" = true ] || return 0
+ MFR_ADG_OPERATION=1 "$scripts_dir/box.dns-gate" sync "${1:-sync}"
+}
+gate_health_needed() {
+ [ "${dns_gate_managed:-false}" = true ] || return 1
+ gate_paths
+ if [ -f /data/adb/modules/box_for_root/disable ]; then gate_alive || [ -s "$box_run_state/dns-gate.capture" ]; return $?; fi
+ gate_alive || return 0
+ [ -s "$gate_state" ] && [ -s "$box_run_state/dns-gate.capture" ] || return 0
+ [ ! -s "$gate_error" ] || return 0
+ if [ "$(cat "$box_run_state/dns-gate.capture")" != transparent-v2 ];then return 0;fi
+ if [ "$("$bin_dir/yq" -r '.china_ipv6 // false' "$gate_state")" = true ];then
+  [ "$(gate_cn_version)" = "$("$bin_dir/yq" -r '.cn_version' "$gate_state")" ] || return 0
+ fi
+ return 1
+}
+gate_status() {
+ local directory="$1" agh="$2" active=false restriction='' backend='unknown' mode count=0 label enabled=true
+ gate_paths
+ gate_preferences > "$directory/ipv6-dns.json" || return 1
+ mode=$("$bin_dir/yq" -r '.mode' "$directory/ipv6-dns.json")
+ case "$mode" in on) label=开启 ;; off) label=关闭 ;; blacklist) label=黑名单 ;; whitelist) label=白名单 ;; esac
+ if [ "$mode" = blacklist ] || [ "$mode" = whitelist ]; then
+  count=$(MFR_LIST="$mode" "$bin_dir/yq" '[.[strenv(MFR_LIST)][] | sub("^\\s+"; "") | sub("\\s+$"; "") | select(length > 0 and test("^#") == false) | downcase] | unique | length' "$directory/ipv6-dns.json")
+ fi
+ if gate_alive && [ -s "$gate_state" ] && [ -s "$box_run_state/dns-gate.capture" ]; then active=true; fi
+ [ ! -s "$gate_state" ] || backend=$("$bin_dir/yq" -r '.backend' "$gate_state" 2>/dev/null)
+ if [ -s "$gate_error" ]; then active=false; fi
+ if [ "$(cat "$box_run_state/dns-gate.capture" 2>/dev/null)" != transparent-v2 ];then active=false;fi
+ local china=false
+ china=$("$bin_dir/yq" -r '.china_ipv6 // false' "$directory/ipv6-dns.json")
+ local core=false runtime="$box_dir/mihomo/.box-runtime.yaml" summary="$label · 未生效 · DNS 控制服务异常"
+ if [ "$active" = true ]; then
+  if [ "$backend" = agh ]; then
+   if [ "$("$bin_dir/yq" -r '.api_available' "$agh")" != true ]; then
+    restriction='AGH 状态待确认'
+   elif [ "$("$bin_dir/yq" -r '.aaaa_filter' "$agh")" = enabled ]; then
+    restriction='AGH 阻止 IPv6 解析'
+   fi
+   [ "$("$bin_dir/yq" -r '.upstream' "$agh")" != mihomo ] || core=true
+  elif [ "$backend" = mihomo ]; then core=true; fi
+  if [ -z "$restriction" ] && [ "$core" = true ]; then
+   if [ "$("$bin_dir/yq" -r '.ipv6' "$runtime" 2>/dev/null)" = false ]; then restriction='Mihomo IPv6 已关闭'
+   elif [ "$("$bin_dir/yq" -r '.dns.ipv6' "$runtime" 2>/dev/null)" = false ]; then restriction='Mihomo IPv6 解析已关闭'
+   elif [ "$("$bin_dir/yq" -r '.dns."enhanced-mode"' "$runtime" 2>/dev/null)" = fake-ip ] &&
+        [ -z "$("$bin_dir/yq" -r '.dns."fake-ip-range6" // ""' "$runtime" 2>/dev/null)" ]; then restriction='Mihomo IPv6 Fake-IP 未启用'; fi
+  fi
+  summary="$label · 生效中"
+  [ "$mode" != whitelist ] && [ "$mode" != blacklist ] || summary="$summary · $count 个域名"
+  [ "$china" != true ] || summary="$summary · 中国大陆放行"
+  if [ -n "$restriction" ] && { [ "$china" = true ] || { [ "$mode" != off ] && { [ "$mode" != whitelist ] || [ "$count" -gt 0 ]; }; }; }; then
+   summary="$label · 放行受限 · $restriction"
+  fi
+ fi
+ MFR_GATE_ACTIVE="$active" MFR_GATE_BACKEND="$backend" MFR_GATE_SUMMARY="$summary" MFR_GATE_RESTRICTION="$restriction" MFR_GATE_PREF="$directory/ipv6-dns.json" "$bin_dir/yq" -n -o=json '
+ {"active":(strenv(MFR_GATE_ACTIVE) == "true"),"backend":strenv(MFR_GATE_BACKEND),"summary":strenv(MFR_GATE_SUMMARY),
+  "restriction":strenv(MFR_GATE_RESTRICTION),"preferences":load(strenv(MFR_GATE_PREF))}'
+}
+
+# Parse live Android networks only. Keep numeric link addresses and network DNS;
+# dedicated service networks keep their original marked sockets before capture.
+gate_networks() {
+ busybox awk '
+ function flush( n,i,s,a,k,protect,sep) {
+  if(id !~ /^[0-9]+$/ || id<1 || id>65535 || iface !~ /^[A-Za-z0-9_.:-]+$/ || iface ~ /^(lo|tun[0-9]*|utun[0-9]*|meta)$/) return
+  if(seen[id]++) return
+  protect=(caps ~ /(^|[^A-Z_])(IMS|MMS|XCAP|EIMS|SUPL|RCS)([^A-Z_]|$)/ && caps !~ /(^|[^A-Z_])INTERNET([^A-Z_]|$)/)
+  if(count++) printf ","
+  printf "{\"id\":%d,\"interface\":\"%s\",\"protected\":%s,\"dns\":[",id,iface,(protect?"true":"false")
+  n=split(dns,a,/[[:space:],]+/);sep=""
+  for(i=1;i<=n;i++){s=a[i];sub(/^\//,"",s);if(s ~ /^[fF][eE]80:/ && s !~ /%/)s=s "%" iface
+   if(s ~ /^[0-9a-fA-F:.%_A-Za-z0-9-]+$/ && (s ~ /:/ || s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)){printf "%s\"%s\"",sep,s;sep=","}}
+  printf "],\"addresses\":[";n=split(addresses,a,/[[:space:],]+/);sep=""
+  for(i=1;i<=n;i++){s=a[i];sub(/^\//,"",s);sub(/\/[0-9]+$/,"",s)
+   if(s ~ /^[0-9a-fA-F:.]+$/ && (s ~ /:/ || s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)){printf "%s\"%s\"",sep,s;sep=","}}
+  printf "]}"
+ }
+ BEGIN {printf "{\"networks\":["}
+ /Active default network:/ {active=$NF;next}
+ /^[[:space:]]*NetworkAgentInfo[[:space:]]*\{/ {
+  flush();id="";iface="";dns="";addresses="";caps="";record=1
+  line=$0;if(match(line,/network\{[0-9]+\}/)){id=substr(line,RSTART+8,RLENGTH-9)}
+ }
+ record && /^[^[:space:]]/ && $0 !~ /^NetworkAgentInfo[[:space:]]*\{/ {flush();record=0;id=""}
+ record {
+  if(/InterfaceName:/){line=$0;sub(/^.*InterfaceName:[[:space:]]*/,"",line);split(line,a,/[[:space:]}]/);iface=a[1]}
+  if(/DnsAddresses:/){line=$0;sub(/^.*DnsAddresses:[[:space:]]*\[/,"",line);sub(/\].*$/,"",line);dns=line}
+  if(/LinkAddresses:/){line=$0;sub(/^.*LinkAddresses:[[:space:]]*\[/,"",line);sub(/\].*$/,"",line);addresses=line}
+  if(caps == "" && /Capabilities:/){line=$0;sub(/^.*Capabilities:[[:space:]]*/,"",line);sub(/[[:space:]}].*$/,"",line);caps=line}
+ }
+ END {flush();printf "],\"default_network\":%d}\n",(active ~ /^[0-9]+$/?active:0)}
+ '
+}
+gate_geosite() {
+ local file
+ . "$scripts_dir/geodata.utils"
+ file=$(mfr_geo_path GeoSite.dat)
+ [ -s "$file" ] || return 1
+ printf '%s\n' "$file"
+}
+gate_cn_version() {
+ local file;file=$(gate_geosite) || return 1
+ busybox stat -c '%i:%Y:%s' "$file"
+}
+
+gate_carrier_rules() {
+ local output="$1" config="$box_run_state/carrier-config.$$"
+ cat "$box_dir/templates/carrier-dns.txt" > "$output" || return 1
+ # Read only named service endpoint fields; save domain names, never full URLs,
+ # identities, tokens or a carrier-config dump. No general carrier-site exemption.
+ dumpsys carrier_config 2>/dev/null | busybox awk '
+  /^[[:space:]]*[A-Za-z0-9_.]+[[:space:]]*=/ {
+   key=$0;sub(/=.*/,"",key);gsub(/[[:space:]]/,"",key)
+   if(key !~ /^((imsserviceentitlement\.)?entitlement_server_url_string|rcs_config_server_url_string|ims\..*(domain|server_url)_string|.*xcap.*(domain|url)_string|gps\.supl_host)$/)next
+   value=$0;sub(/^[^=]*=[[:space:]]*/,"",value);sub(/^https?:\/\//,"",value);sub(/[\/:?#[:space:]].*$/,"",value)
+   if(value ~ /^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z][A-Za-z0-9.-]*$/ && !seen[value]++)print tolower(value)
+  }' >> "$output" || return 1
+ # Apply the same bounded domain grammar as user lists before reloading.
+ MFR_CARRIER_RULES="$output" "$bin_dir/yq" -n -o=json '{"mode":"on","blacklist":[],"whitelist":(load_str(strenv(MFR_CARRIER_RULES)) | split("\n"))}' > "$config" || return 1
+ gate_valid "$config";local result=$?;rm -f "$config";return "$result"
+}
+
+gate_check_preset() {
+ local wanted="$1" directory="$2" file
+ [ "$("$bin_dir/yq" -r '.china_ipv6 // false' "$wanted")" = true ] || return 0
+ file=$(gate_geosite) || return 1
+ MFR_CN_FILE="$file" "$bin_dir/yq" -o=json '. * {"backend":"system","upstreams":["127.0.0.1:1"],"geosite":strenv(MFR_CN_FILE)}' "$wanted" > "$directory/cn-check.json" || return 1
+ "$bin_dir/dns-gate" -config "$directory/cn-check.json" -check >/dev/null 2>&1
+}

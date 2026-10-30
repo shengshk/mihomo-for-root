@@ -85,7 +85,7 @@ switch_upstream() {
   if [ "$mode" = mihomo ]; then
     # The local upstream address stays the same across Wi-Fi/mobile changes.
     # Include its underlying network so AGH cannot reuse the old network cache.
-    snapshot=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network)
+    snapshot=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network_all)
     expected="mihomo|$(cat "$box_pid" 2>/dev/null)|$snapshot"
     [ "$expected" != "$(cat "$adg_state" 2>/dev/null)" ] || return 0
     # Check the actual DNS listener, not just an existing PID or controller.
@@ -93,7 +93,7 @@ switch_upstream() {
     adg_dns_ready || { error 'Mihomo DNS 未就绪'; return 76; }
     servers="$mfr_dns_address"
   else
-    snapshot=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network)
+    snapshot=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network_all)
     servers=${snapshot##*\|}
     # No current network means a closed local upstream, never AGH defaults.
     [ -n "$servers" ] || servers='127.0.0.1:1'
@@ -107,7 +107,7 @@ switch_upstream() {
   # Supplying upstream_dns to AGH always rebuilds its DNS server.
   local applied previous_servers
   applied=$(cat "$adg_state" 2>/dev/null)
-  previous_servers=${applied##*|}
+  previous_servers=${applied##*\|}
   case "$applied" in mihomo\|*) previous_servers="$mfr_dns_address" ;; esac
   if [ -z "$applied" ] || [ "$previous_servers" != "$servers" ]; then
   MFR_ADG_API_TIMEOUT=4 adg_api POST dns_config --data-binary "{\"upstream_dns\":$json,\"upstream_dns_file\":\"\",\"fallback_dns\":[],\"use_private_ptr_resolvers\":false,\"local_ptr_upstreams\":[]}" >/dev/null || {

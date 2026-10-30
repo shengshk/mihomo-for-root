@@ -15,10 +15,18 @@ ROOT = Path(__file__).resolve().parents[1]
 YQ = os.environ.get('MFR_TEST_YQ') or shutil.which('yq')
 AGH = os.environ.get('MFR_TEST_AGH')
 
+_fixture_ports=set()
 def port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+    # DNS fixtures bind both transports; a free TCP port can still have a live
+    # UDP owner. Avoid collisions with that owner and our own earlier choices.
+    for _ in range(100):
+        with socket.socket() as tcp,socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp:
+            tcp.bind(('127.0.0.1',0));number=tcp.getsockname()[1]
+            if number in _fixture_ports:continue
+            try:udp.bind(('127.0.0.1',number))
+            except OSError:continue
+            _fixture_ports.add(number);return number
+    raise RuntimeError('no free TCP/UDP DNS fixture port')
 
 DNS_SERVER = '''import socket,struct,sys
 from pathlib import Path

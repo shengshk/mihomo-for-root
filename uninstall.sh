@@ -4,6 +4,7 @@ box_data_dir="/data/adb/box"
 "${box_data_dir}/scripts/box.cron" stop >/dev/null 2>&1
 "${box_data_dir}/scripts/box.policy" stop >/dev/null 2>&1
 "${box_data_dir}/scripts/box.http" stop >/dev/null 2>&1
+"${box_data_dir}/scripts/box.dns-gate" stop >/dev/null 2>&1
 "${box_data_dir}/scripts/box.adg" stop >/dev/null 2>&1
 rm_data() {
   if [ ! -d "${box_data_dir}" ]; then

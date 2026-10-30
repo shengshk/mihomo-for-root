@@ -56,6 +56,11 @@ VALUES
     if [ "${dns_hijack_tcp:-false}" = true ] || [ "${dns_hijack_udp:-false}" = true ] ||
        { [ "$capture" = TUN ] && [ "$("$bin_dir/yq" '.tun."dns-hijack" | length' "$config")" -gt 0 ]; }; then agh="DNS 劫持"; fi
   fi
+  if [ "${dns_gate_managed:-false}" = true ] && [ -s "$box_run_state/dns-gate.applied.json" ]; then
+    case "$("$bin_dir/yq" -r '.backend' "$box_run_state/dns-gate.applied.json")" in
+      agh) agh=AGH ;; mihomo) agh="Mihomo DNS" ;; system) agh="系统 DNS" ;;
+    esac
+  fi
   printf '%s · %s · %s · %s · %s · %s\n' "$state" "$routing" "$capture" "$mode" "$family" "$agh"
 }
 mfr_write_description() {

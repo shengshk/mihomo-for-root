@@ -215,7 +215,9 @@ case "$1" in
           retries=0
         elif [ "$retries" -gt 0 ]; then retries=$((retries-1)); fi
         next_retry=$((now+2))
-        network=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network)
+        if [ "${dns_gate_managed:-false}" = true ];then
+          network=$(dumpsys connectivity 2>/dev/null | gate_networks)
+        else network=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network);fi
         if [ "$policy_transition" = true ] && [ "$result" = 0 ]; then
           last_network="$network"
         elif [ "$now" -ge "$next_adg_retry" ] &&

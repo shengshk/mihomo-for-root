@@ -20,3 +20,180 @@ mfr_seed_geodata() {
     fi
   done
 }
+
+# Core and DNS front-end must resolve the very same file, including case aliases.
+mfr_geo_path() {
+  local file="$1" directory="${2:-$box_dir/mihomo}" found
+  if [ "$file" = Country.mmdb ]; then
+    found=$(busybox find "$directory" -maxdepth 1 \( -iname "$file" -o -iname geoip.db -o -iname geoip.metadb \) -print | LC_ALL=C sort | head -n 1)
+  else
+    found=$(busybox find "$directory" -maxdepth 1 -iname "$file" -print | LC_ALL=C sort | head -n 1)
+  fi
+  printf '%s\n' "${found:-$directory/$file}"
+}
+
+mfr_geo_status() {
+  local file="$manage_dir/geodata.json"
+  if [ -s "$file" ] && "$bin_dir/yq" -e 'tag == "!!map"' "$file" >/dev/null 2>&1; then
+    "$bin_dir/yq" -o=json '{"updated":(.updated // ""),"files":(.files // {})}' "$file"
+  else
+    printf '{"updated":"","files":{}}\n'
+  fi
+}
+
+mfr_geo_progress() {
+  local phase="$1"
+  MFR_GEO_ID="$geo_id" MFR_GEO_PHASE="$phase" MFR_GEO_PID="$$" \
+    "$yq" -n -o=json '{"id":strenv(MFR_GEO_ID),"phase":strenv(MFR_GEO_PHASE),"pid":env(MFR_GEO_PID)}' > "$work/progress.json" &&
+    mv "$work/progress.json" "$manage_dir/geodata-progress.json"
+}
+
+# Validate in an isolated data directory. Invalid inputs may trigger Mihomo's
+# repair download, so all test URLs point to a closed local port, never live data.
+mfr_geo_validate() {
+  local file="$1" directory="$work/check-$1" rule mode=true
+  mkdir -p "$directory" || return 1
+  cp "$work/geodata/$file" "$directory/$file" || return 1
+  case "$file" in
+    GeoSite.dat) rule='GEOSITE,cn,DIRECT' ;;
+    GeoIP.dat) rule='GEOIP,cn,DIRECT' ;;
+    Country.mmdb) rule='GEOIP,cn,DIRECT'; mode=false ;;
+    ASN.mmdb) rule='IP-ASN,13335,DIRECT' ;;
+    *) return 1 ;;
+  esac
+  cat > "$directory/check.yaml" <<EOF
+log-level: error
+geodata-mode: $mode
+geo-auto-update: false
+geox-url:
+  geoip: http://127.0.0.1:1/disabled
+  geosite: http://127.0.0.1:1/disabled
+  mmdb: http://127.0.0.1:1/disabled
+  asn: http://127.0.0.1:1/disabled
+rules:
+  - $rule
+  - MATCH,DIRECT
+EOF
+  busybox timeout 25 "$bin_path" -t -d "$directory" -f "$directory/check.yaml" > "$directory/check.log" 2>&1 || return 1
+  if [ "$file" = GeoSite.dat ] && [ "$("$yq" -r '.ipv6_dns.china_ipv6 // false' "$preferences_file")" = true ]; then
+    gate_preferences > "$directory/policy.json" || return 1
+    MFR_GEO_FILE="$work/geodata/$file" "$yq" -o=json \
+      '. * {"backend":"system","upstreams":["127.0.0.1:1"],"geosite":strenv(MFR_GEO_FILE)}' \
+      "$directory/policy.json" > "$directory/gate.json" || return 1
+    busybox timeout 25 "$bin_dir/dns-gate" -config "$directory/gate.json" -check > "$directory/gate.log" 2>&1 || return 1
+  fi
+  rm -rf "$directory"
+}
+
+mfr_geo_apply() {
+  # Reuse the authoritative service lifecycle for live cores: rebuild rules and
+  # mmap/cache users together, respecting current Wi-Fi and persistent intent.
+  if [ "$geo_was_running" = true ]; then
+    apply_current || return 1
+  fi
+  case " $geo_files " in
+    *' GeoSite.dat '*) MFR_ADG_OPERATION=1 "$scripts_dir/box.dns-gate" sync > "$work/gate-apply.log" 2>&1 || return 1 ;;
+  esac
+}
+
+mfr_geo_restore() {
+  local file target failed=false
+  for file in $geo_files; do
+    target=$(cat "$work/geodata/$file.target")
+    if [ -f "$work/geodata/$file.old" ]; then
+      cp -p "$work/geodata/$file.old" "$target.next" && mv "$target.next" "$target" || failed=true
+    else
+      rm -f "$target" || failed=true
+    fi
+  done
+  if [ -f "$work/geodata/state.old" ]; then
+    cp -p "$work/geodata/state.old" "$manage_dir/geodata.json.next" &&
+      mv "$manage_dir/geodata.json.next" "$manage_dir/geodata.json" || failed=true
+  else rm -f "$manage_dir/geodata.json" || failed=true; fi
+  [ "$failed" = false ] || return 1
+  mfr_geo_apply
+}
+
+# Called by the manager EXIT trap before deleting work or releasing its lock.
+mfr_geo_cleanup() {
+  [ "${geo_active:-false}" = true ] || return 0
+  local phase='更新失败，原库已保留'
+  if [ "${geo_committed:-false}" = true ]; then
+    if mfr_geo_restore; then phase='更新失败，已恢复原库';
+    else
+      # Keep this bounded recovery directory on the phone for manual recovery.
+      phase='恢复未完成，请查看日志'
+      local recovery
+      recovery=$(mktemp -d "$manage_dir/geodata-recovery.XXXXXX") && mv "$work/geodata" "$recovery/" 2>/dev/null
+    fi
+  elif [ "${geo_stopped:-false}" = true ]; then
+    mfr_geo_apply || phase='代理恢复失败，请查看日志'
+  fi
+  command -v log >/dev/null 2>&1 && log Warning "Geo 数据库：$phase" >/dev/null 2>&1
+  mfr_geo_progress "$phase"
+}
+
+mfr_geo_update() {
+  local kind file key url target stamp
+  kind=$("$yq" -r '.kind // "all"' "$request")
+  geo_id=$("$yq" -r '.id // ""' "$request")
+  case "$geo_id" in ''|*[!a-z0-9_-]*) fail '更新标识无效。' ;; esac
+  [ "${#geo_id}" -le 80 ] || fail '更新标识无效。'
+  case "$kind" in
+    all) geo_files='GeoSite.dat GeoIP.dat Country.mmdb ASN.mmdb' ;;
+    geosite) geo_files='GeoSite.dat' ;;
+    geoip) geo_files='GeoIP.dat Country.mmdb' ;;
+    asn) geo_files='ASN.mmdb' ;;
+    *) fail '数据库类型无效。' ;;
+  esac
+  lock_operation
+  geo_active=true; geo_committed=false; geo_stopped=false; geo_was_running=false
+  running && geo_was_running=true
+  mfr_geo_progress '准备更新…' || fail '无法保存更新状态。'
+  mkdir "$work/geodata" || fail '无法创建更新目录。'
+  mfr_expand_config "$mihomo_config" "$work/geo-effective.yaml" > "$work/expand.log" 2>&1 || fail '无法读取数据库下载地址。'
+  for file in $geo_files; do
+    case "$file" in GeoSite.dat) key=geosite ;; GeoIP.dat) key=geoip ;; Country.mmdb) key=mmdb ;; ASN.mmdb) key=asn ;; esac
+    url=$(MFR_GEO_KEY="$key" "$yq" -r '."geox-url"[strenv(MFR_GEO_KEY)] // ""' "$work/geo-effective.yaml")
+    if [ -z "$url" ]; then
+      url=$(MFR_GEO_KEY="$key" "$yq" -r '."geox-url"[strenv(MFR_GEO_KEY)]' "$box_dir/templates/default.yaml")
+    fi
+    case "$url" in https://*|http://*) ;; *) fail '数据库下载地址无效，请检查 geox-url。' ;; esac
+    mfr_geo_progress "下载 $file…"
+    MFR_DOWNLOAD_TIMEOUT=90 download "$url" "$work/geodata/$file" 134217728 || fail "$file 下载失败，原库已保留。"
+    [ -s "$work/geodata/$file" ] || fail "$file 内容为空，原库已保留。"
+    mfr_geo_progress "校验 $file…"
+    mfr_geo_validate "$file" || fail "$file 校验失败，原库已保留。"
+    target=$(mfr_geo_path "$file")
+    [ ! -e "$target" ] || [ -f "$target" ] || fail '数据库路径类型无效。'
+    printf '%s\n' "$target" > "$work/geodata/$file.target" || fail '无法记录数据库路径。'
+  done
+  mfr_geo_status > "$work/geodata-state.json" || fail '无法读取数据库更新记录。'
+  [ ! -f "$manage_dir/geodata.json" ] || cp -p "$manage_dir/geodata.json" "$work/geodata/state.old" || fail '无法备份更新记录。'
+  stamp=$(date '+%Y-%m-%d %H:%M:%S')
+  for file in $geo_files; do
+    MFR_GEO_FILE="$file" MFR_GEO_TIME="$stamp" "$yq" -i -o=json \
+      '.updated = strenv(MFR_GEO_TIME) | .files[strenv(MFR_GEO_FILE)] = strenv(MFR_GEO_TIME)' "$work/geodata-state.json" || fail '无法记录数据库更新时间。'
+  done
+  mfr_geo_progress '应用数据库…'
+  # Stop live readers (and Mihomo's own auto-updater) only after all candidates
+  # passed validation. The service lifecycle also keeps AGH on a ready upstream.
+  if [ "$geo_was_running" = true ]; then
+    geo_stopped=true
+    "$scripts_dir/box.service" stop > "$work/geo-stop.log" 2>&1 && ! running || fail '代理停止失败，正在恢复原库。'
+  fi
+  for file in $geo_files; do
+    target=$(cat "$work/geodata/$file.target")
+    [ ! -e "$target" ] || cp -p "$target" "$work/geodata/$file.old" || fail '无法备份原数据库。'
+  done
+  geo_committed=true
+  for file in $geo_files; do
+    target=$(cat "$work/geodata/$file.target")
+    chmod 600 "$work/geodata/$file" && mv "$work/geodata/$file" "$target" || fail '数据库替换失败，正在恢复原库。'
+  done
+  mfr_geo_apply || fail '数据库应用失败，正在恢复原库。'
+  mv "$work/geodata-state.json" "$manage_dir/geodata.json" || fail '更新记录保存失败，正在恢复原库。'
+  geo_committed=false; geo_active=false
+  mfr_geo_progress '更新完成'
+  mfr_geo_status
+}

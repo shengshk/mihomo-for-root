@@ -27,3 +27,11 @@ mfr_dns_port_owners() {
       printf '%s (PID %s)\n' "${owner:-$name}" "$pid"
     done
 }
+
+# Unified ordinary DNS entry, independent of AGH/core lifecycle.
+dns_gate_port=15354
+dns_gate_address="127.0.0.1:$dns_gate_port"
+gate_bridge_port=15355
+gate_v6_mark="268435456/268435456"
+gate_v6_table=2055
+gate_v6_pref=91

@@ -48,6 +48,9 @@ def verify(archive_only=False, candidate=None):
                 raise ValueError('AGH 与当前锁修复补丁不一致')
             if hashlib.sha256(package.read('box/licenses/AdGuardHome-access-lock.patch')).hexdigest() != agh['patch_sha256']:
                 raise ValueError('AGH 随包补丁与二进制记录不一致')
+            gate = dependencies['files']['arm64-v8a/dns-gate']
+            if gate['source_sha256'] != hashlib.sha256((ROOT / 'scripts/dns-gate/main.go').read_bytes()).hexdigest():
+                raise ValueError('统一 DNS 入口与当前源码不一致')
             bridge = dependencies['files']['arm64-v8a/agh-dns-bridge']
             if bridge['source_sha256'] != hashlib.sha256((ROOT / 'scripts/agh-dns-bridge/main.go').read_bytes()).hexdigest():
                 raise ValueError('DNS 转发器与当前源码不一致')

@@ -4,6 +4,10 @@ scripts_dir="${0%/*}"
 source /data/adb/box/settings.ini
 [ ! -s "$box_dir/mihomo/.box-runtime.yaml" ] || mihomo_config="$box_dir/mihomo/.box-runtime.yaml"
 mfr_tun_resolve "$mihomo_config"
+if [ "${dns_gate_managed:-false}" = true ]; then
+  dns_hijack_mode=disable; mihomo_dns_forward=disable
+  dns_hijack_tcp=false; dns_hijack_udp=false
+fi
 
 runtime_iptables_env="${box_run_state}/runtime.iptables.env"
 cnip_force_proxy_uid_list="${box_run_state}/cnip_force_proxy.uid.list"
@@ -136,7 +140,15 @@ add_core_bypass_rule() {
 
   [ -n "${insert_action}" ] || insert_action="-A"
 
-  if [ "${adguardhome_enabled:-false}" = true ]; then
+  if [ "${dns_gate_managed:-false}" = true ];then
+    # The independent transparent DNS entry preserves original Android network
+    # marks. Let it handle port 53 even when core chains are reinserted first.
+    ${iptables} -t "${table_name}" "${insert_action}" "${chain_name}" -p udp --dport 53 -j RETURN >/dev/null 2>&1 || return 1
+    ${iptables} -t "${table_name}" "${insert_action}" "${chain_name}" -p tcp --dport 53 -j RETURN >/dev/null 2>&1 || return 1
+  fi
+
+  if [ "${adguardhome_enabled:-false}" = true ] || [ "${dns_gate_managed:-false}" = true ]; then
+    ${iptables} -t "${table_name}" "${insert_action}" "${chain_name}" -m owner --uid-owner 0 --gid-owner 19055 -j RETURN >/dev/null 2>&1 || return 1
     ${iptables} -t "${table_name}" "${insert_action}" "${chain_name}" -m owner --uid-owner 0 --gid-owner 19054 -j RETURN >/dev/null 2>&1 || return 1
   fi
 
@@ -1972,7 +1984,7 @@ disable_ipv6() {
   sysctl -w net.ipv4.ip_forward=1
   sysctl -w net.ipv6.conf.all.forwarding=0
 
-  if [ "${adguardhome_enabled:-false}" = true ]; then
+  if [ "${adguardhome_enabled:-false}" = true ] || [ "${dns_gate_managed:-false}" = true ]; then
     # DNS must reach OUTPUT before it can be intercepted. A routing-level
     # unreachable rule would reject it too early. Block only other data here.
     ipv6_enable
@@ -1980,6 +1992,7 @@ disable_ipv6() {
     ip6tables -w 3 -t filter -F BOX_IPV6_OFF || return 1
     ip6tables -w 3 -t filter -A BOX_IPV6_OFF -p ipv6-icmp -j RETURN || return 1
     ip6tables -w 3 -t filter -A BOX_IPV6_OFF -d ::1 -j RETURN || return 1
+    ip6tables -w 3 -t filter -A BOX_IPV6_OFF -m owner --uid-owner 0 --gid-owner 19055 -j RETURN || return 1
     ip6tables -w 3 -t filter -A BOX_IPV6_OFF -m owner --uid-owner 0 --gid-owner 19054 -j RETURN || return 1
     ip6tables -w 3 -t filter -A BOX_IPV6_OFF -p udp --dport 53 -j RETURN || return 1
     ip6tables -w 3 -t filter -A BOX_IPV6_OFF -p tcp --dport 53 -j RETURN || return 1
@@ -2293,9 +2306,10 @@ start_tun_bypass() {
   append_tun_dns_rules "${pre_chain}"
   append_tun_bypass_destination_rules "${pre_chain}"
 
-  if [ "${adguardhome_enabled:-false}" = true ]; then
-    # NAT OUTPUT redirects these packets to local AGH after mangle. Keep them
-    # out of the TUN routing table so the local reroute can reach the listener.
+  if [ "${dns_gate_managed:-false}" = true ];then
+    ensure_rule_append mangle "${out_chain}" -p udp --dport 53 -j RETURN
+    ensure_rule_append mangle "${out_chain}" -p tcp --dport 53 -j RETURN
+  elif [ "${adguardhome_enabled:-false}" = true ];then
     append_mark_and_return_rule mangle "${out_chain}" "${tun_bypass_mark}" -p udp --dport 53
     append_mark_and_return_rule mangle "${out_chain}" "${tun_bypass_mark}" -p tcp --dport 53
   fi

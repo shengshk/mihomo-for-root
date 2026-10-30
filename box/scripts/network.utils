@@ -74,6 +74,13 @@ mfr_dns_resolve() {
 mfr_dns_override() {
   local input="$1" output="$2" from
   MFR_DNS_LISTEN="$mfr_dns_address" "$bin_dir/yq" -i '.dns.listen = strenv(MFR_DNS_LISTEN)' "$output" || return 1
+  if [ "${dns_gate_managed:-false}" = true ]; then
+    if [ "${adguardhome_enabled:-false}" = true ] || [ "${dns_hijack_setting:-follow}" = on ]; then
+      "$bin_dir/yq" -i '.dns.enable = true' "$output" || return 1
+    fi
+    "$bin_dir/yq" -i '.tun."dns-hijack" = []' "$output"
+    return $?
+  fi
   if [ "${adguardhome_enabled:-false}" = true ]; then
     "$bin_dir/yq" -i '.dns.enable = true | .tun."dns-hijack" = []' "$output"
     return $?

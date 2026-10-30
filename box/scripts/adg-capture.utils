@@ -111,6 +111,8 @@ adg_v6_capture() {
   done
 }
 capture() {
+  if [ "${dns_gate_managed:-false}" = true ] && [ "$1" != legacy-remove ]; then return 0; fi
+  [ "$1" != legacy-remove ] || set -- remove
   if [ "$1" = remove ]; then
     rules_family iptables remove || return 1
     rules_family ip6tables remove || return 1

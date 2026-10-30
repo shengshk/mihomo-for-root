@@ -12,6 +12,7 @@ scripts_dir="${0%/*}"
 . "$scripts_dir/adg.utils"
 . "$scripts_dir/adg-controls.utils"
 . "$scripts_dir/status.utils"
+. "$scripts_dir/geodata.utils"
 adg_paths
 box_dns_paths
 yq="$bin_dir/yq"
@@ -45,6 +46,7 @@ initialize() {
 }
 
 cleanup() {
+  mfr_geo_cleanup
   [ -z "${work:-}" ] || rm -rf "$work"
   if [ "${owned_lock:-false}" = true ]; then
     rm -f "$manage_dir/operation.lock/pid"
@@ -194,6 +196,16 @@ defaults_output() {
 }
 
 case "$1" in
+  geodata-update)
+    mfr_geo_update
+    ;;
+  geodata-progress)
+    geo_id=$("$yq" -r '.id // ""' "$request")
+    if [ -s "$manage_dir/geodata-progress.json" ] &&
+       MFR_GEO_ID="$geo_id" "$yq" -e '.id == strenv(MFR_GEO_ID)' "$manage_dir/geodata-progress.json" >/dev/null 2>&1; then
+      "$yq" -o=json '{"phase":.phase}' "$manage_dir/geodata-progress.json"
+    else printf '{"phase":""}\n'; fi
+    ;;
   defaults-get)
     defaults_output || fail '无法读取兜底 YAML。'
     ;;
@@ -266,7 +278,10 @@ case "$1" in
     effective_config="$box_dns_runtime"; [ -s "$effective_config" ] || effective_config="$mihomo_config"
     fake_ip=$("$yq" -r '.dns."enhanced-mode" == "fake-ip"' "$effective_config")
     printf '%s\n' "$servers" | busybox awk 'BEGIN {printf "["} {for(i=1;i<=NF;i++){if(n++)printf ",";printf "\"%s\"",$i}} END {print "]"}' > "$work/detected.json"
-    adg_status "$work" "$work/detected.json" > "$work/adguardhome.json"
+    all_snapshot=$(dumpsys connectivity 2>/dev/null | box_dns_parse_network_all)
+    printf '%s\n' "${all_snapshot##*\|}" | busybox awk 'BEGIN {printf "["} {for(i=1;i<=NF;i++){if(n++)printf ",";printf "\"%s\"",$i}} END {print "]"}' > "$work/detected-all.json"
+    adg_status "$work" "$work/detected-all.json" > "$work/adguardhome.json"
+    gate_status "$work" "$work/adguardhome.json" > "$work/ipv6-dns.status.json" || fail '无法读取 IPv6 DNS 状态。'
     summary_state=stopped
     [ "$paused" != true ] || summary_state=paused
     [ "$live" != true ] || summary_state=running
@@ -279,15 +294,17 @@ case "$1" in
     mfr_profile_modes "$mihomo_config" "$work/mihomo-base.json" || fail '无法读取 Mihomo 配置。'
     mfr_profile_dns "$mihomo_config" "$work/profile-dns.json" || fail '无法读取 Mihomo DNS。'
     defaults_custom=false; [ ! -f "$manage_dir/defaults.yaml" ] || defaults_custom=true
-    MFR_ADG_DEFAULTS="$work/adg-defaults.json" MFR_DEFAULTS_CUSTOM="$defaults_custom" MFR_ADG_CONTROLS="$work/adg-controls.json" MFR_APP_COUNTS="$work/app-counts.json" MFR_MIHOMO_BASE="$work/mihomo-base.json" MFR_SUMMARY="$summary" MFR_PROFILE_DNS="$work/profile-dns.json" MFR_ADG_JSON="$work/adguardhome.json" \
+    mfr_geo_status > "$work/geodata.json"
+    MFR_GATE_STATUS="$work/ipv6-dns.status.json" MFR_ADG_DEFAULTS="$work/adg-defaults.json" MFR_DEFAULTS_CUSTOM="$defaults_custom" MFR_ADG_CONTROLS="$work/adg-controls.json" MFR_APP_COUNTS="$work/app-counts.json" MFR_MIHOMO_BASE="$work/mihomo-base.json" MFR_SUMMARY="$summary" MFR_PROFILE_DNS="$work/profile-dns.json" MFR_ADG_JSON="$work/adguardhome.json" \
     MFR_OPERATION_STATE="$operation_state" MFR_VERSION="$core_version" MFR_RUNNING="$live" MFR_PREF="$preferences_file" MFR_DB="$db" \
       MFR_SOURCE="$mihomo_config" MFR_DETECTED="$work/detected.json" MFR_SSID="$ssid" MFR_PAUSED="$paused" \
-      MFR_ROUTING_MODE="$effective_routing" MFR_FAKE_IP="$fake_ip" "$yq" -n -o=json '
+      MFR_GEODATA="$work/geodata.json" MFR_ROUTING_MODE="$effective_routing" MFR_FAKE_IP="$fake_ip" "$yq" -n -o=json '
       {"running": (strenv(MFR_RUNNING) == "true"), "operation_state":strenv(MFR_OPERATION_STATE), "version": strenv(MFR_VERSION), "summary":strenv(MFR_SUMMARY),
        "defaults_custom":(strenv(MFR_DEFAULTS_CUSTOM) == "true"),
+       "geodata":load(strenv(MFR_GEODATA)),
        "adg_controls":load(strenv(MFR_ADG_CONTROLS)), "adg_defaults":load(strenv(MFR_ADG_DEFAULTS)),
        "app_counts":load(strenv(MFR_APP_COUNTS)), "mihomo_base":load(strenv(MFR_MIHOMO_BASE)),
-       "adguardhome":load(strenv(MFR_ADG_JSON)),
+       "adguardhome":load(strenv(MFR_ADG_JSON)), "ipv6_dns":load(strenv(MFR_GATE_STATUS)),
        "wifi_paused": (strenv(MFR_PAUSED) == "true"), "current_ssid": strenv(MFR_SSID),
        "routing_mode":strenv(MFR_ROUTING_MODE), "fake_ip":(strenv(MFR_FAKE_IP) == "true"),
        "preferences": ({"tun_mode":"follow", "dns_mode":"follow", "dns_hijack_mode":"follow", "adguardhome_enabled":false, "wifi_pause_enabled":false, "wifi_pause_ssids":[]} * load(strenv(MFR_PREF))), "configs": load(strenv(MFR_DB)),
@@ -373,6 +390,7 @@ case "$1" in
       section=$("$yq" -r '.section' "$request")
       case "$section" in
         mihomo) fields='["tun_mode","dns_mode","ipv6_mode","dns_hijack_mode","append_network_dns","dns_override","dns_profile_id"]' ;;
+        ipv6dns) fields='["ipv6_dns"]' ;;
         agh) fields='["adguardhome_enabled","adg_controls","adg_reset_defaults"]' ;;
         apps) fields='["app_mode","include_apps","exclude_apps"]' ;;
         wifi) fields='["wifi_pause_enabled","wifi_pause_ssids"]' ;;
@@ -398,6 +416,13 @@ case "$1" in
     if [ "$("$yq" 'has("adguardhome_enabled")' "$request")" != true ]; then
       MFR_ADG="$("$yq" -r '.adguardhome_enabled // false' "$preferences_file")" "$yq" -i '.adguardhome_enabled = (strenv(MFR_ADG) == "true")' "$request"
     fi
+    if [ "$("$yq" 'has("ipv6_dns")' "$request")" != true ]; then
+      gate_preferences > "$work/ipv6-dns.previous.json" || fail '无法读取 IPv6 DNS 设置。'
+      MFR_GATE_PREF="$work/ipv6-dns.previous.json" "$yq" -i '.ipv6_dns = load(strenv(MFR_GATE_PREF))' "$request" || fail '无法保留 IPv6 DNS 设置。'
+    fi
+    "$yq" -o=json '.ipv6_dns' "$request" > "$work/ipv6-dns.wanted.json"
+    gate_valid "$work/ipv6-dns.wanted.json" || fail 'IPv6 DNS 设置无效：域名每行一个，支持整行 # 注释。'
+    gate_check_preset "$work/ipv6-dns.wanted.json" "$work" || fail '中国大陆域名库不可用，请检查 GeoSite 数据库。'
     for field in tun_mode dns_mode; do
       if [ "$(MFR_FIELD="$field" "$yq" 'has(strenv(MFR_FIELD))' "$request")" != true ]; then
         MFR_FIELD="$field" MFR_PREVIOUS="$preferences_file" "$yq" -i '.[strenv(MFR_FIELD)] = (load(strenv(MFR_PREVIOUS))[strenv(MFR_FIELD)] // "follow")' "$request"
@@ -455,7 +480,7 @@ case "$1" in
     fi
     cp -p "$preferences_file" "$work/preferences.previous"
     "$yq" -o=json '{"tun_mode":.tun_mode,"dns_mode":.dns_mode,"routing_mode":.routing_mode,"ipv6_mode":.ipv6_mode,"append_network_dns":.append_network_dns,
-      "adguardhome_enabled":.adguardhome_enabled,"dns_hijack_mode":.dns_hijack_mode,"wifi_pause_enabled":.wifi_pause_enabled,"wifi_pause_ssids":(.wifi_pause_ssids | unique),
+      "ipv6_dns":.ipv6_dns,"adguardhome_enabled":.adguardhome_enabled,"dns_hijack_mode":.dns_hijack_mode,"wifi_pause_enabled":.wifi_pause_enabled,"wifi_pause_ssids":(.wifi_pause_ssids | unique),
       "app_mode":.app_mode,"include_apps":(.include_apps | unique),"exclude_apps":(.exclude_apps | unique)}' "$request" > "$work/preferences.next"
     if [ "$("$yq" 'has("adg_controls")' "$request")" = true ]; then
       MFR_REQUEST="$request" "$yq" -i -o=json '.adg_controls = (load(strenv(MFR_REQUEST)).adg_controls | pick(["ipv6_filter","ipv6_allow","adblock","filter_urls"]))' "$work/preferences.next" || fail '无法保存 AGH 设置。'
@@ -468,8 +493,8 @@ case "$1" in
     was_running=false; running && was_running=true
     apply_needed=true
     if MFR_OLD="$work/preferences.previous" MFR_NEW="$preferences_file" "$yq" -n -e '
-      (load(strenv(MFR_OLD)) | del(.adg_controls) | .tun_mode = (.tun_mode // "follow") | .dns_mode = (.dns_mode // "follow") | sort_keys(..) | to_json) ==
-      (load(strenv(MFR_NEW)) | del(.adg_controls) | sort_keys(..) | to_json)' >/dev/null &&
+      (load(strenv(MFR_OLD)) | del(.adg_controls, .ipv6_dns) | .tun_mode = (.tun_mode // "follow") | .dns_mode = (.dns_mode // "follow") | sort_keys(..) | to_json) ==
+      (load(strenv(MFR_NEW)) | del(.adg_controls, .ipv6_dns) | sort_keys(..) | to_json)' >/dev/null &&
        MFR_OLD="$work/profiles.previous" MFR_NEW="$db" "$yq" -n -e '
       (load(strenv(MFR_OLD)) | .active as $id | .profiles[] | select(.id == $id) | .dns_override // {} | sort_keys(..) | to_json) ==
       (load(strenv(MFR_NEW)) | .active as $id | .profiles[] | select(.id == $id) | .dns_override // {} | sort_keys(..) | to_json)' >/dev/null; then apply_needed=false; fi

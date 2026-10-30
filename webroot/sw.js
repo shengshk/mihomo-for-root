@@ -1,5 +1,5 @@
 "use strict";
-const CACHE="mfr-shell-2026102801";
+const CACHE="mfr-shell-2026102904";
 const ASSETS=["./","./manage.html","./manage.css","./rpc.js","./apps.js","./manage.js","./pwa.js","./theme.js","./manifest.webmanifest","./manifest-dark.webmanifest","./icon.svg","./icon-192.png","./icon-512.png","./icon-maskable-512.png"];
 const URLS=new Set(ASSETS.map(path=>new URL(path,self.registration.scope).href));
 self.addEventListener("install",event=>{

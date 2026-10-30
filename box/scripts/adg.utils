@@ -1,5 +1,6 @@
 #!/system/bin/sh
 if [ -z "${mfr_dns_port:-}" ] && [ -n "${box_dir:-}" ]; then . "$box_dir/scripts/ports.utils"; fi
+[ ! -f "${box_dir:-}/scripts/dns-gate.utils" ] || . "$box_dir/scripts/dns-gate.utils"
 # GID isolates the root DNS daemon from Android netd and ordinary app queries.
 adg_paths() {
   adg_dir="$box_dir/adguardhome"
@@ -78,11 +79,13 @@ adg_api() {
 # released before runtime DNS is restored, keeping the lock order one-way.
 adg_sync() {
   local result=0 phase="${1:-sync}"
+  if [ "${dns_gate_managed:-false}" = true ]; then gate_paths; gate_migrate || return 1; fi
   MFR_ADG_OPERATION=1 "$scripts_dir/box.adg" "$@" || result=$?
   case "$result" in 0|78) ;; *) return "$result" ;; esac
   if [ -f "$manage_dir/adguardhome-recovery-pending" ]; then
     "$scripts_dir/box.service" adg-recover "$phase" || return 1
   fi
+  [ "${dns_gate_managed:-false}" != true ] || gate_sync "$phase" || return $?
   return 0
 }
 
@@ -127,6 +130,7 @@ adg_status() {
      "error":strenv(MFR_ADG_ERROR),"capture":strenv(MFR_ADG_CAPTURE)}'
 }
 adg_health_needed() {
+  if [ "${dns_gate_managed:-false}" = true ]; then gate_health_needed && return 0; fi
   [ ! -f "$adg_recovery_pending" ] || return 0
   [ "${adguardhome_enabled:-false}" = true ] || return 1
   [ ! -f /data/adb/modules/box_for_root/disable ] || return 0

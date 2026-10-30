@@ -36,10 +36,8 @@ filters:
     name: AdBlock DNS
     id: 217
 whitelist_filters: []
-user_rules:
-  - '! 仅允许指定域名及其子域名查询 AAAA。'
-  - '! 替换示例域名后，删除规则前的“! ”启用。'
-  - '! $dnstype=AAAA,denyallow=example.com|example.net,dnsrewrite=NOERROR;;'
+# IPv6 DNS policy is managed by the independent module DNS entry.
+user_rules: []
 querylog:
   enabled: true
   interval: 24h

@@ -43,7 +43,7 @@ done
 [ -s "$data/mihomo/config.yaml" ] || cp "$data/templates/default.yaml" "$data/mihomo/config.yaml"
 . "$data/scripts/geodata.utils"
 mfr_seed_geodata "$MODPATH/assets/geodata" "$data/mihomo" || abort '! 安装初始 Geo 数据失败。'
-for utility in yq curl agh-dns-bridge; do
+for utility in yq curl agh-dns-bridge dns-gate; do
   cp "$MODPATH/assets/arm64-v8a/$utility" "$data/bin/$utility.next" || abort '! 安装工具失败。'
   chmod 700 "$data/bin/$utility.next"
   mv "$data/bin/$utility.next" "$data/bin/$utility"

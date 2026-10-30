@@ -9,7 +9,7 @@
   let defaultsLoaded = false, defaultsRevision = "", adgResetPending = false;
   let dnsProfileId = "", defaultsBaseline = "";
   const savedSections = {};
-  const settingCards = {mihomo:"network-settings",agh:"adg-settings",apps:"apps-settings",wifi:"wifi-settings"};
+  const settingCards = {ipv6dns:"ipv6-dns-settings",mihomo:"network-settings",agh:"adg-settings",apps:"apps-settings",wifi:"wifi-settings"};
   const dnsFields = ["nameserver", "fallback", "default-nameserver"];
   const dnsLines = field => [...new Set($("dns-" + field).value.split(/\r?\n/).map(value => value.trim()).filter(Boolean))];
   function message(text, error = false) { $("message").textContent = text; $("message").classList.toggle("error",error); }
@@ -37,11 +37,12 @@
     const dns=choice("dns-mode") === "follow" ? base.dns_mode : choice("dns-mode");
     const v6=choice("ipv6-mode") === "follow" ? base.ipv6 : choice("ipv6-mode") === "on";
     updateNotice();
+    updateGateControl();
     // This card previews settings, independently of whether the core is paused.
     const hijackMode=choice("dns-hijack-mode"), entries=base.dns_hijack || [];
     const yamlCapture=base.dns_enabled && (tun ? entries.length > 0 : entries.some(entry => /^(?:(?:udp|tcp):\/\/)?(?:any|0\.0\.0\.0):53$/.test(entry)));
-    const capture=state?.preferences.adguardhome_enabled ? "AGH劫持DNS" :
-      (hijackMode === "on" || (hijackMode === "follow" && yamlCapture)) ? "Mihomo劫持DNS" : "不劫持DNS";
+    const capture=state?.preferences.adguardhome_enabled ? "AGH入口" :
+      (hijackMode === "on" || (hijackMode === "follow" && yamlCapture)) ? "Mihomo DNS入口" : "系统 DNS入口";
     $("network-summary").textContent=[tun ? "TUN" : "TProxy",dns === "fake-ip" ? "Fake-IP" : "Redir-Host",v6 ? "IPv6" : "IPv4",capture,$("append-dns").checked ? "追加系统 DNS" : ""].filter(Boolean).join(" · ");
     const mode=choice("app-mode");
     const installed=loadedApps && selected[mode] ? applications.filter(app=>selected[mode].has(app.packageName)).length : (state?.app_counts?.[mode] || 0);
@@ -61,8 +62,9 @@
         dns_hijack_mode:choice("dns-hijack-mode"),append_network_dns:$("append-dns").checked,
         dns_profile_id:dnsProfileId,dns_override:structuredClone(dnsOverrides),
         _dns_values:Object.fromEntries(dnsFields.map(field=>[field,dnsLines(field)]))};
+      case "ipv6dns": return {ipv6_dns:{mode:choice("ipv6-dns-mode"),china_ipv6:$("ipv6-dns-china").checked,blacklist:adgLines("ipv6-dns-blacklist"),whitelist:adgLines("ipv6-dns-whitelist")}};
       case "agh": return {adguardhome_enabled:$("adg-enabled").checked,adg_reset_defaults:adgResetPending,
-        adg_controls:{ipv6_filter:$("adg-ipv6-filter").checked,ipv6_allow:adgLines("adg-ipv6-allow"),
+        adg_controls:{ipv6_filter:false,ipv6_allow:[],
           adblock:$("adg-adblock").checked,filter_urls:adgLines("adg-filter-urls")}};
       case "apps": return {app_mode:choice("app-mode"),include_apps:[...selected.include].sort(),exclude_apps:[...selected.exclude].sort()};
       case "wifi": return {wifi_pause_enabled:$("wifi-pause").checked,wifi_pause_ssids:wifiNames().sort()};
@@ -75,10 +77,13 @@
         $("append-dns").checked=draft.append_network_dns;
         dnsProfileId=draft.dns_profile_id; dnsOverrides=structuredClone(draft.dns_override);
         renderDns(draft._dns_values); break;
+      case "ipv6dns":
+        setChoice("ipv6-dns-mode",draft.ipv6_dns.mode);
+        $("ipv6-dns-china").checked=draft.ipv6_dns.china_ipv6 || false;
+        $("ipv6-dns-blacklist").value=draft.ipv6_dns.blacklist.join("\n");
+        $("ipv6-dns-whitelist").value=draft.ipv6_dns.whitelist.join("\n"); break;
       case "agh":
         $("adg-enabled").checked=draft.adguardhome_enabled;
-        $("adg-ipv6-filter").checked=draft.adg_controls.ipv6_filter;
-        $("adg-ipv6-allow").value=draft.adg_controls.ipv6_allow.join("\n");
         $("adg-adblock").checked=draft.adg_controls.adblock;
         $("adg-filter-urls").value=draft.adg_controls.filter_urls.join("\n");
         adgResetPending=draft.adg_reset_defaults; $("adg-restore-status").hidden=!adgResetPending; break;
@@ -205,13 +210,28 @@
     $("adg-recovery-notice").textContent = reason ? "AGH 切换失败，已停用；可在帮助中重新启用。" : "";
     $("help-enable-adg").textContent = reason ? "重新启用 AdGuard Home" : "启用 AdGuard Home";
   }
+  function updateGateControl() {
+    const mode=choice("ipv6-dns-mode") || "on";
+    const labels={on:"开启",off:"关闭",blacklist:"黑名单",whitelist:"白名单"};
+    $("ipv6-dns-black-field").hidden=mode!=="blacklist";
+    $("ipv6-dns-white-field").hidden=mode!=="whitelist";
+    $("ipv6-dns-help").textContent=({on:"允许所有域名查询 IPv6 地址。",off:"其余域名的 IPv6 地址查询返回空结果。",blacklist:"清单内域名返回空结果，其余允许解析。",whitelist:"仅清单内域名允许解析，其余返回空结果。"})[mode];
+    const observed=state?.ipv6_dns;
+    if (!observed) {$("ipv6-dns-summary").textContent="读取中"; return;}
+    const effective=value=>({mode:value.mode,china_ipv6:!!value.china_ipv6,...Object.fromEntries(["blacklist","whitelist"].map(key=>[key,[...new Set(value[key].map(line=>line.trim().toLowerCase()).filter(line=>line && !line.startsWith("#")))].sort()]))});
+    if (fingerprint(effective(readSection("ipv6dns").ipv6_dns)) === fingerprint(effective(observed.preferences))) {
+      $("ipv6-dns-summary").textContent=observed.summary; return;
+    }
+    const values=(mode==="blacklist" || mode==="whitelist") ? adgLines("ipv6-dns-"+mode).filter(line=>!line.trim().startsWith("#")) : [];
+    $("ipv6-dns-summary").textContent=labels[mode] + ((mode==="blacklist" || mode==="whitelist") ? " · " + new Set(values.map(line=>line.trim().toLowerCase())).size + " 个域名" : "") + ($("ipv6-dns-china").checked ? " · 中国大陆放行" : "");
+  }
   function renderAdgState() {
     const adg = state.adguardhome || {};
     const upstreamNames={system:"系统DNS 作为上游",mihomo:"MihomoDNS 作为上游",pending:"上游待就绪",other:"其他DNS 作为上游",unknown:"上游未知"};
     const filterNames={enabled:"阻止 IPv6 解析",disabled:"允许 IPv6 解析",unknown:"IPv6 解析状态未知"};
     $("adg-state").textContent = adg.error || (!state.preferences.adguardhome_enabled ? "未启用" :
       !adg.running ? "已停止" : adg.api_available === false ? "状态读取失败" :
-      "运行中 · " + (upstreamNames[adg.upstream] || "上游未知") + " · " + (filterNames[adg.aaaa_filter] || "v6状态未知"));
+      "运行中 · " + (upstreamNames[adg.upstream] || "上游未知"));
     updateAdgVisibility();
   }
   function updateAdgControl() {
@@ -219,13 +239,11 @@
     const capture = !!state?.preferences.adguardhome_enabled;
     $("dns-hijack-mode").querySelectorAll("button").forEach(button => button.disabled = busy || capture);
     $("dns-hijack-mode").hidden = capture;
-    $("dns-hijack-label").textContent = capture ? "DNS 劫持：关闭 · AGH 接管" : "DNS 劫持";
+    $("dns-hijack-label").textContent = capture ? "DNS 入口 · AGH" : "DNS 入口";
     $("dns-hijack-help").hidden = capture;
     $("adg-shortcuts").disabled = busy || !enabled;
-    $("adg-ipv6-allow").disabled = busy || !enabled || !$("adg-ipv6-filter").checked;
-    $("adg-ipv6-field").hidden = !$("adg-ipv6-filter").checked;
     $("adg-filter-field").hidden = !$("adg-adblock").checked;
-    $("dns-hijack-help").textContent = "跟随 YAML／开启／关闭，接管普通 TCP、UDP 53。";
+    $("dns-hijack-help").textContent = "选择统一过滤后的 DNS 入口。";
   }
   function renderDns(values) {
     for (const field of dnsFields) $("dns-" + field).value = (values[field] || []).join("\n");
@@ -242,16 +260,15 @@
     message("已恢复配置值，保存后生效。");
   };
   $("adg-enabled").onchange = () => { updateAdgControl(); updateSummaries(); };
-  $("adg-ipv6-filter").onchange = updateAdgControl;
   $("adg-adblock").onchange = updateAdgControl;
+  for (const id of ["ipv6-dns-blacklist","ipv6-dns-whitelist"]) $(id).addEventListener("input",updateSummaries);
   $("append-dns").onchange = updateSummaries;
+  $("ipv6-dns-china").onchange = updateSummaries;
   $("wifi-pause").onchange = updateSummaries;
   $("wifi-ssids").addEventListener("input",updateSummaries);
   $("adg-restore").onclick = () => {
     const defaults=state?.adg_defaults;
     if (!defaults) return;
-    $("adg-ipv6-filter").checked=defaults.ipv6_filter;
-    $("adg-ipv6-allow").value=adgEditor(defaults.ipv6_allow);
     $("adg-adblock").checked=defaults.adblock;
     $("adg-filter-urls").value=adgEditor(defaults.filter_urls);
     adgResetPending=true;
@@ -285,19 +302,23 @@
     renderServiceState();
     $("defaults-summary").textContent = state.defaults_custom ? "自定义兜底" : "内置兜底";
     $("core-version").textContent = state.version;
+    renderGeodata(state.geodata);
     setChoice("routing-mode", state.routing_mode || state.preferences.routing_mode || "rule");
     dnsOverrides = structuredClone(state.dns.override);
     dnsProfileId = state.configs.active;
     renderDns(state.dns.effective);
     $("dns-detected").textContent = state.dns_detected.join("\n") || "未检测到系统 DNS";
     preferences = state.preferences;
+    const gate=state.ipv6_dns?.preferences || {mode:"on",blacklist:[],whitelist:[]};
+    setChoice("ipv6-dns-mode",gate.mode);
+    $("ipv6-dns-china").checked=gate.china_ipv6 || false;
+    $("ipv6-dns-blacklist").value=adgEditor(gate.blacklist);
+    $("ipv6-dns-whitelist").value=adgEditor(gate.whitelist);
     $("adg-enabled").checked = preferences.adguardhome_enabled || false;
     renderAdgState();
     adgResetPending=false;
     $("adg-restore-status").hidden=true;
     const controls=state.adg_controls;
-    $("adg-ipv6-filter").checked=controls.ipv6_filter;
-    $("adg-ipv6-allow").value=adgEditor(controls.ipv6_allow);
     $("adg-adblock").checked=controls.adblock;
     $("adg-filter-urls").value=adgEditor(controls.filter_urls);
     updateAdgControl();
@@ -605,6 +626,36 @@
     if (!state || state.operation_state) return;
     operation(state.running || state.wifi_paused ?"正在停止代理…":"正在启动代理…",()=>MFR.run(state.running || state.wifi_paused ? "stop":"start"));
   };
+  function renderGeodata(data) {
+    const item=$("geodata-updated");
+    item.textContent="上次手动更新：" + (data?.updated || "尚未更新");
+    item.title=Object.entries(data?.files || {}).map(([name,time])=>name + "：" + time).join("\n");
+  }
+  document.querySelectorAll("[data-geodata]").forEach(button=>{
+    button.onclick=()=>operation("准备更新数据库…",async()=>{
+      const id="g" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const progress=$("geodata-progress");
+      let pending=true,timer;
+      progress.hidden=false;progress.textContent="准备更新…";
+      const poll=async()=>{
+        try {
+          const result=await MFR.run("geodata-progress",{id});
+          if(pending && result.phase) {
+            progress.textContent=result.phase;
+            $("activity-text").textContent=result.phase;
+          }
+        } catch (_) { /* The update request reports its own error. */ }
+        if(pending) timer=setTimeout(poll,1000);
+      };
+      timer=setTimeout(poll,500);
+      try {
+        const result=await MFR.run("geodata-update",{kind:button.dataset.geodata,id});
+        renderGeodata(result);progress.textContent="更新完成。";
+      } catch(error) {
+        progress.textContent=error.message;throw error;
+      } finally {pending=false;clearTimeout(timer);}
+    },{done:"数据库已更新。"});
+  });
   $("core-check").onclick=()=>operation("检查更新…",async()=>{
     const result=await MFR.run("core-check");
     $("latest-version").textContent="官方稳定版："+result.latest+(state.version.includes(result.latest)?"，当前已是此版本。":"，可点击更新。");

@@ -1,7 +1,7 @@
 (function () {
   "use strict";
   let sequence = 0;
-  function exec(command, payload) {
+  function exec(command, payload, timeoutMs = 180000) {
     return new Promise((resolve, reject) => {
       if (!window.ksu || typeof window.ksu.exec !== "function") {
         reject(new Error("请从 Root 管理器打开模块管理。"));
@@ -11,7 +11,7 @@
       const timeout = setTimeout(() => {
         delete window[callback];
         reject(new Error("操作超时，可稍后刷新查看结果。"));
-      }, 180000);
+      }, timeoutMs);
       window[callback] = (errno, stdout, stderr) => {
         clearTimeout(timeout);
         delete window[callback];
@@ -55,7 +55,7 @@
       }
       payload = {__request_token:upload.token};
     }
-    return exec("/system/bin/sh /data/adb/box/scripts/box.manager " + action, payload);
+    return exec("/system/bin/sh /data/adb/box/scripts/box.manager " + action, payload, action === "geodata-update" ? 600000 : 180000);
   }
   function dashboardUrl(config) {
     let controller = String(config.controller || "127.0.0.1:9090");
